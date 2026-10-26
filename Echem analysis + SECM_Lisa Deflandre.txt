@@ -1,0 +1,2910 @@
+import pandas as pd
+import queue
+import re
+import numpy as np
+import tkinter as tk
+from threading import Thread
+from scipy.signal import savgol_filter
+from pybaselines.whittaker import aspls
+from tkinter import ttk
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from pybaselines.whittaker import arpls
+import time
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import atexit
+import os
+from tkinter import Tk, StringVar, filedialog, Button, Label
+from matplotlib.ticker import LinearLocator, FormatStrFormatter, FuncFormatter
+
+#os.environ['TCL_LIBRARY'] = r'C:\Users\User\AppData\Local\Programs\Python\Python313\tcl\tcl8.6'
+
+shared_state = {
+    "directory": None,
+    "stop": False,
+    "last_parameters": {},
+    "norm_ref_height": None,   # hauteur de pic (µA) de la référence externe
+    "norm_ref_file": None,     # chemin du fichier référence
+    "norm_ref_meta": None,
+    "single_trace_peak": None,
+    "monitor_running": False
+}
+
+
+results = []  # Liste de dictionnaires pour stocker les résultats fichier par fichier
+secm_positions = []
+tens_formatter = FuncFormatter(lambda v, pos: f"{int(np.round(v/10)*10)}")
+gui_queue = queue.Queue()
+
+plt.style.use('seaborn-v0_8-whitegrid')  # ou essaye 'ggplot' ou 'bmh'
+
+# === SYSTÈME DE LOGS ===
+import sys
+from io import StringIO
+
+
+class LogCapture:
+    """Redirige les print() vers un widget Text Tkinter ET vers la console Python."""
+
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+        self.original_stdout = sys.__stdout__  # Console Python originale
+        self.original_stderr = sys.__stderr__
+
+    def write(self, message):
+        """Écrit dans le widget Text ET dans la console Python."""
+        # ✅ TOUJOURS afficher dans la console Python originale
+        self.original_stdout.write(message)
+        self.original_stdout.flush()
+
+        if message.strip():  # Ignorer les lignes vides
+            log_line = message.strip() + "\n"
+
+            def _update_widget():
+                self.text_widget.insert("end", log_line)
+
+                lines = self.text_widget.get("1.0", "end").split('\n')
+                if len(lines) > 100:
+                    self.text_widget.delete("1.0", "2.0")
+
+                self.text_widget.see("end")
+                self.text_widget.update_idletasks()
+
+            self.text_widget.after(0, _update_widget)
+
+
+    def flush(self):
+        """Nécessaire pour être compatible avec sys.stdout."""
+        self.original_stdout.flush()
+
+# Définition des bornes du pic et de la plage de potentiel
+PEAK_RANGE = (-0.30, -0.23)  # Plage de potentiel pour le pic
+POTENTIAL_RANGE = (-0.42, -0.10)  # Plage de potentiel pour la baseline
+
+# Paramètres globaux pour ARPLS
+LAM = 1e05  # Valeur de lambda
+WEIGHT_EXTREMES = 200  # Poids pour les extrémités du voltamogramme
+WEIGHT_CENTRAL = 50  # Poids pour le reste du voltamogramme
+EXTREMES_PERCENTAGE = 0.020  # Pourcentage des points à appliquer aux extrémités (10% par défaut)
+MAX_ITER = 150  # Nombre d'itérations max pour airPLS
+TOL = 0.001  # Tolérance pour airPLS
+THRESHOLD = 0.05  # Seuil de résidu pour valider la baseline
+
+# --- Paramètres filtre Savitsky Golay ---
+SAVGOL_WINDOW = 11
+POLYORDER = 1
+
+# --- Paramètres Hampel ---
+HAMPEL_WINDOW = 11
+HAMPEL_SIGMA = 2.5
+HAMPEL_MAX_PASS = 3
+
+# --- Paramètres d'interface graphique ---
+MAIN_WINDOW_SIZE = "1400x700"
+HELP_WINDOW_SIZE = "900x700"
+GAIN_WINDOW_SIZE = "800x600"
+MAX_LOG_LINES = 100
+LOG_TEXT_HEIGHT = 6
+LOG_TEXT_WIDTH = 100
+ENTRY_FIELD_WIDTH = 10          # champs potentiel/pic
+CALIB_FIELD_WIDTH = 20          # champs Vmax/K/n Langmuir-Hill
+GRAPH_FRAME_WIDTH = 700
+MAIN_FIGSIZE = (7, 5)           # graphique voltamogramme principal
+GAIN_FIGSIZE = (8, 5)           # graphique de gain
+SECM_FIGSIZE = (7, 6)           # carte SECM
+
+gain_window = None
+root = None
+status_var = None
+ax_gain = None
+canvas_gain = None
+pos_x, pos_y = None, None
+
+
+def set_format_coord_xy(ax):
+    """Affiche x,y dynamiques en bas (status bar Matplotlib)."""
+    def _fmt(x, y):
+        return f"x={x:.3f} V, y={y:.4f} µA"
+    ax.format_coord = _fmt
+
+
+def _ensure_peak_text_artist(ax):
+    """
+    Crée (si besoin) un texte fixe en bas à droite pour afficher les infos du pic.
+    Stocke l'artiste dans shared_state["peak_text_artist"].
+    """
+    txt = shared_state.get("peak_text_artist")
+    if txt is not None:
+        return txt
+
+    txt = ax.text(
+        0.99, 0.01, "",
+        transform=ax.transAxes,
+        ha="right", va="bottom",
+        fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.4", alpha=0.85),
+        zorder=10
+    )
+    shared_state["peak_text_artist"] = txt
+    return txt
+
+def update_fixed_peak_display(ax, canvas, file_name=None, peak_height_uA=None, peak_V=None, visible=True):
+    """Met à jour le texte fixe (toujours visible) affichant les infos du pic."""
+    txt = _ensure_peak_text_artist(ax)
+
+    if not visible or peak_height_uA is None or peak_V is None:
+        txt.set_text("")
+        txt.set_visible(False)
+    else:
+        label = f"Pic = {peak_height_uA:.4g} µA @ {peak_V:.3f} V"
+        if file_name:
+            label = f"{file_name}\n{label}"
+        txt.set_text(label)
+        txt.set_visible(True)
+
+    if canvas is not None:
+        canvas.draw_idle()
+
+
+def _ensure_peak_var_text_artist(ax):
+    """
+    Crée (si besoin) un texte fixe en haut à droite pour afficher le pic du fichier
+    en cours de traitement (mode temps réel / choix de fichier).
+    """
+    txt = shared_state.get("peak_var_text_artist")
+    if txt is not None:
+        return txt
+
+    txt = ax.text(
+        0.99, 0.99, "",
+        transform=ax.transAxes,
+        ha="right", va="top",
+        fontsize=10,
+        fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.4", alpha=0.85),
+        zorder=10
+    )
+    shared_state["peak_var_text_artist"] = txt
+    return txt
+
+
+def update_peak_var_display(ax, canvas, text):
+    """Met à jour le texte fixe (haut-droite) affichant 'Pic: ... µA @ ... V'."""
+    txt = _ensure_peak_var_text_artist(ax)
+    txt.set_text(text)
+    if canvas is not None:
+        canvas.draw_idle()
+
+
+
+
+
+def monitor_directory(directory, callback, shared_state):
+    processed_files = set()
+    start_time = None
+
+    print("🔍 Surveillance du dossier démarrée...")
+
+    while not shared_state["stop"]:
+        try:
+            all_files = sorted([
+                os.path.join(directory, f) for f in os.listdir(directory)
+                if f.endswith(".txt")
+            ], key=lambda x: os.path.getmtime(x))
+        except (FileNotFoundError, OSError) as e:
+            print(f"⚠️ Erreur lecture du dossier : {e}")
+            time.sleep(2)
+            shared_state["monitor_running"] = False
+            print("✅ Surveillance arrêtée.")
+            continue
+
+
+        new_files = [f for f in all_files if f not in processed_files]
+
+        if new_files and start_time is None:
+            start_time = os.path.getmtime(new_files[0])
+
+        for file_path in new_files:
+            if shared_state["stop"]:
+                print("⏸️ Stop request : interruption of file processing.")
+                break
+            try:
+                elapsed_time = os.path.getmtime(file_path) - start_time
+                print(f"▶️ Processing of : {file_path}")
+                callback(file_path, elapsed_time)
+            except Exception as e:
+                import traceback
+                print(f"💥 Error during process of {file_path} : {e}")
+                traceback.print_exc()
+            processed_files.add(file_path)
+
+        time.sleep(2)
+
+def apply_savgol_filter(data, window_length, polyorder):
+    """
+    Applique Savitzky–Golay en ajustant automatiquement (window_length, polyorder)
+    aux contraintes du signal (taille, parité, ordre).
+    """
+    y = np.asarray(data, dtype=float)
+    wl, po = adjust_savgol_params(len(y), window_length, polyorder)
+    return savgol_filter(y, window_length=wl, polyorder=po)
+
+def adjust_savgol_params(n: int, wl: int, po: int):
+    """
+    Ajuste (wl, po) pour Savitzky–Golay:
+    - wl >= 3 et impair
+    - wl <= n-1 (ou n-2 si nécessaire) pour rester valide
+    - wl > po (sinon wl = po + 1, puis forcer impair)
+    Retourne (wl, po) ajustés.
+    """
+    wl = int(max(3, wl))
+    po = int(po)
+
+    # wl ne doit pas dépasser la taille utile
+    if wl > n:
+        wl = n - 1 if (n - 1) % 2 == 1 else n - 2
+    wl = max(3, wl)
+
+    # wl doit être impair
+    if wl % 2 == 0:
+        wl -= 1
+
+    # wl doit être strictement > po
+    if wl <= po:
+        wl = po + 1
+        if wl % 2 == 0:
+            wl += 1
+        if wl > n:
+            wl = n - 1 if (n - 1) % 2 == 1 else n - 2
+            wl = max(3, wl)
+
+    return wl, po
+
+
+def calculate_baseline_arpls(data, potential, potential_range, lam=LAM,
+                             weight_extremes=WEIGHT_EXTREMES,
+                             weight_central=WEIGHT_CENTRAL,
+                             extremes_percentage=EXTREMES_PERCENTAGE,
+                             max_iter=MAX_ITER, tol=TOL,
+                             filename=None):
+    # Utiliser potential_range dynamique ici !
+    potential_indices = (potential >= potential_range[0]) & (potential <= potential_range[1])
+
+    """
+    Calcule la baseline en utilisant la méthode ARPLS avec des paramètres dynamiques.
+    """
+    if filename is None:
+        print("⚠️ Le paramètre 'filename' est None ! Vérifiez l'appel de la fonction.")
+
+
+    # Filtrer la plage de potentiels
+    data_filtered = data[potential_indices]
+    potential_filtered = potential[potential_indices]
+
+    if len(data_filtered) < 10:
+        print(f"⚠️ Pas assez de données dans la plage de potentiel pour {filename}")
+        return None, potential_filtered
+
+    def calculate_adaptive_weights(data_length, data, potential,
+                                   weight_extremes=1e10,
+                                   weight_central=50,
+                                   peak_zone=(-0.32, -0.24),
+                                   anchor_zones=[(-0.40, -0.36), (-0.15, -0.10)]):
+        weight = np.ones(data_length) * weight_central
+        potential = np.array(potential)
+
+        # Forcer les extrémités à coller
+        for zone in anchor_zones:
+            mask = (potential >= zone[0]) & (potential <= zone[1])
+            weight[mask] = weight_extremes
+
+        # Ignorer la zone du pic
+        mask_peak = (potential >= peak_zone[0]) & (potential <= peak_zone[1])
+        weight[mask_peak] = 0.001
+
+        return weight
+
+    weight = calculate_adaptive_weights(len(data_filtered), data_filtered, potential_filtered)
+
+    try:
+        # Calcul de la baseline avec ARPLS
+        baseline, _ = arpls(data_filtered, lam=lam, diff_order=2, weights=weight, max_iter=max_iter, tol=tol)
+        return baseline, potential_filtered
+    except Exception as e:
+        print(f"⚠️ Error in ARPLS for {filename}: {e}")
+        return None, potential_filtered
+
+
+def calculate_baseline_aSpls(data, potential, potential_range, lam=LAM,
+                             weight_extremes=WEIGHT_EXTREMES,
+                             weight_central=WEIGHT_CENTRAL,
+                             extremes_percentage=EXTREMES_PERCENTAGE,
+                             max_iter=MAX_ITER, tol=TOL,
+                             filename=None):
+
+    potential_indices = (potential >= potential_range[0]) & (potential <= potential_range[1])
+    if filename is None:
+        print("⚠️ Parameter 'filename' est None ! Check call of fonction.")
+
+    data_filtered = data[potential_indices]
+    potential_filtered = potential[potential_indices]
+
+    if len(data_filtered) < 10:
+        print(f"⚠️ Not enough data in potential window for {filename}")
+        return None, potential_filtered
+
+    def calculate_adaptive_weights(data_length, data, potential,
+                                   weight_extremes=1e10,
+                                   weight_central=50,
+                                   peak_zone=(-0.32, -0.24),
+                                   anchor_zones=[(-0.40, -0.36), (-0.15, -0.10)]):
+        weight = np.ones(data_length) * weight_central
+        potential = np.array(potential)
+
+        # Forcer les extrémités à coller
+        for zone in anchor_zones:
+            mask = (potential >= zone[0]) & (potential <= zone[1])
+            weight[mask] = weight_extremes
+
+        # Ignorer la zone du pic
+        mask_peak = (potential >= peak_zone[0]) & (potential <= peak_zone[1])
+        weight[mask_peak] = 0.001
+
+        return weight
+
+    weight = calculate_adaptive_weights(len(data_filtered), data_filtered, potential_filtered)
+
+    try:
+        # Calcul de la baseline avec ARPLS
+        baseline, _ = aspls(data_filtered, lam=lam, diff_order=2, weights=weight, max_iter=max_iter, tol=tol)
+        return baseline, potential_filtered
+    except Exception as e:
+        print(f"⚠️ Error in ASPLS for {filename}: {e}")
+        return None, potential_filtered
+
+def validate_baseline(data, baseline, percentage=0.1, max_offset=0.0015, max_bias=0.2, max_slope_diff=0.5):
+    """
+    Valide la qualité de la baseline aux extrémités en vérifiant :
+    - l'écart moyen
+    - le biais
+    - la pente (tendance) par rapport au signal
+
+    Args:
+    - data : signal de courant (array)
+    - baseline : baseline estimée (array)
+    - percentage : portion du signal à analyser sur les extrémités
+    - max_offset : tolérance d'écart moyen
+    - max_bias : tolérance de biais moyen
+    - max_slope_diff : tolérance sur la différence de pente
+
+    Returns:
+    - bool : True si la baseline est jugée correcte, False sinon
+    """
+    n = len(data)
+    num = max(3, int(n * percentage))  # au moins 3 points pour une pente
+
+    def check_side(data_side, base_side):
+        diff = data_side - base_side
+        offset = np.mean(np.abs(diff))
+        bias = np.mean(diff)
+
+        # Approximation de la pente (moindre carrés)
+        x = np.arange(len(data_side))
+        slope_data = np.polyfit(x, data_side, 1)[0]
+        slope_base = np.polyfit(x, base_side, 1)[0]
+        slope_diff = abs(slope_data - slope_base)
+
+        return offset, bias, slope_diff
+
+    left_offset, left_bias, left_slope = check_side(data[:num], baseline[:num])
+    right_offset, right_bias, right_slope = check_side(data[-num:], baseline[-num:])
+
+    conditions = [
+        left_offset <= max_offset,
+        right_offset <= max_offset,
+        abs(left_bias) <= max_bias,
+        abs(right_bias) <= max_bias,
+        left_slope <= max_slope_diff,
+        right_slope <= max_slope_diff
+    ]
+
+    if not all(conditions):
+        return False
+
+    return True
+
+# Calcul de la hauteur du pic en soustrayant la baseline
+def calculate_peak_height(data, baseline, peak_index):
+    data_corrected = data - baseline  # Soustraction de la baseline
+    peak_height = data_corrected.iloc[peak_index]  # Hauteur du pic après correction
+    return peak_height
+
+
+def lire_donnees(file_path):
+    with open(file_path, 'r', encoding='latin1') as f:
+        first_lines = [f.readline() for _ in range(10)]
+
+    if "EC-Lab ASCII FILE" in first_lines[0]:
+
+        # Récupère le nombre de lignes d'en-tête
+        nb_header = 0
+        for line in first_lines:
+            if "Nb header lines" in line:
+                try:
+                    nb_header = int(line.split(":")[1].strip())
+                except:
+                    nb_header = 0
+                break
+
+        # On lit la ligne suivante (avec les vraies données) pour détecter le séparateur décimal
+        with open(file_path, 'r', encoding='latin1') as f:
+            lines = f.readlines()
+
+        data_line = lines[nb_header + 1].strip()
+        decimal_sep = ',' if ',' in data_line else '.'
+
+        # Lecture avec noms imposés
+        df = pd.read_csv(
+            file_path,
+            sep='\t',
+            skiprows=nb_header + 1,
+            names=["Potentiel (V)", "Courant (uA)"],
+            encoding='latin1',
+            decimal=decimal_sep
+        )
+
+    else:
+        # Lecture brute pour détecter le séparateur décimal
+        with open(file_path, 'r', encoding='latin1') as f:
+            lines = f.readlines()
+
+        data_line = lines[1].strip()
+        decimal_sep = ',' if ',' in data_line else '.'
+
+        # Lecture avec noms de colonnes imposés
+        df = pd.read_csv(
+            file_path,
+            sep='\t',
+            decimal=decimal_sep,
+            encoding='latin1',
+            skiprows=1,  # saute la ligne d'en-tête
+            names=["Potentiel (V)", "Courant (A)"]  # noms fixes
+        )
+
+        # Conversion du courant en µA
+        df["Courant (uA)"] = df["Courant (A)"].astype(float) * 1e6
+        df = df.drop(columns=["Courant (A)"])
+
+    return df
+
+def hampel_filter_1d(y, window_size=HAMPEL_WINDOW, n_sigma=HAMPEL_SIGMA, max_passes=HAMPEL_MAX_PASS, use_derivative=True):
+    """
+    Filtre de Hampel renforcé:
+    - Multi-passe (max_passes)
+    - Détection sur le signal et (optionnel) sur sa dérivée
+    - Remplacement par médiane locale ou interpolation linéaire robuste
+
+    Retourne (y_repaired, spike_mask_final)
+    """
+
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    w = int(window_size)
+    if w < 3:
+        w = 3
+    if w % 2 == 0:
+        w += 1
+
+    def _rolling_median(arr, win):
+        return pd.Series(arr).rolling(win, center=True, min_periods=3).median().to_numpy()
+
+    def _mad(arr, center):
+        return pd.Series(np.abs(arr - center)).rolling(w, center=True, min_periods=3).median().to_numpy()
+
+    def _hampel_pass(y_in):
+        med = _rolling_median(y_in, w)
+        sigma = 1.4826 * _mad(y_in, med)
+        diff = np.abs(y_in - med)
+        mask = (sigma > 0) & (diff > n_sigma * sigma)
+        return mask, med
+
+    def _derivative(arr):
+        # dérivée centrale simple; bords en avant/arrière
+        d = np.empty_like(arr)
+        d[1:-1] = 0.5 * (arr[2:] - arr[:-2])
+        d[0] = arr[1] - arr[0]
+        d[-1] = arr[-1] - arr[-2]
+        return d
+
+    def _replace_value(y_arr, idx, med_local, spike_mask):
+        # Si la médiane locale est finie, l’utiliser
+        if np.isfinite(med_local[idx]):
+            return med_local[idx]
+        # sinon: interpolation linéaire robuste avec voisins non-spikes
+        k = max(3, w // 2)
+        start = max(0, idx - k)
+        end   = min(n, idx + k + 1)
+        # indices non spikes dans la fenêtre
+        neighbors = [j for j in range(start, end) if j != idx and not spike_mask[j] and np.isfinite(y_arr[j])]
+        if len(neighbors) >= 2:
+            # fit linéaire local (x=j, y=y[j])
+            x = np.array(neighbors, dtype=float)
+            yy = y_arr[neighbors]
+            try:
+                coeff = np.polyfit(x, yy, 1)
+                return float(np.polyval(coeff, idx))
+            except Exception:
+                return float(np.median(yy))
+        elif len(neighbors) == 1:
+            return float(y_arr[neighbors[0]])
+        else:
+            return y_arr[idx]  # fallback: garder tel quel
+
+    y_work = y.copy()
+    spike_mask_final = np.zeros_like(y, dtype=bool)
+
+    for p in range(max_passes):
+        # Hampel sur le signal
+        mask_sig, med_sig = _hampel_pass(y_work)
+
+        # Hampel sur la dérivée
+        if use_derivative:
+            dy = _derivative(y_work)
+            mask_der, med_der = _hampel_pass(dy)
+            # projeter les spikes de dérivée sur le signal (mêmes indices)
+            mask = mask_sig | mask_der
+        else:
+            mask = mask_sig
+
+        # Nouveaux indices à corriger (éviter de re-traiter ceux déjà remplacés)
+        new_spikes = mask & (~spike_mask_final)
+
+        if not np.any(new_spikes):
+            break  # plus rien à corriger
+
+        # Remplacement
+        y_repaired = y_work.copy()
+        idxs = np.where(new_spikes)[0]
+        for idx in idxs:
+            y_repaired[idx] = _replace_value(y_work, idx, med_sig, mask)
+
+        y_work = y_repaired
+        spike_mask_final = spike_mask_final | new_spikes
+
+    return y_work, spike_mask_final
+
+def compute_peak_height_from_file(file_path, params):
+    """
+    Calcule la hauteur de pic (µA) d'un fichier SWV en réutilisant le pipeline
+    principal (compute_file_result), pour éviter toute divergence entre les deux.
+    Retourne (peak_height, peak_potential, pot, y_filt, baseline_arr, peak_index).
+    """
+    payload = compute_file_result(
+        file_path,
+        potential_range=params["plage_potentiel"],
+        peak_range=params["position_pic"],
+        lam=params["lambda"],
+        method=params.get("baseline_method", "ARPLS"),
+        polyorder=params["polyorder"],
+        window_length=params["window_length"],
+    )
+
+    if payload.get("type") != "full":
+        raise RuntimeError(payload.get("message", "Erreur inconnue lors du traitement du fichier de référence."))
+
+    df = payload["df"]
+    pot = df["Potentiel (V)"].to_numpy(dtype=float)
+    y_filt = df["courant_filtre"].to_numpy(dtype=float)
+    baseline_arr = payload["baseline_full"]
+    peak_index = payload["peak_index"]
+    peak_potential = float(pot[peak_index])
+    peak_height = float(payload["row"]["Peak height (µA)"])
+
+    ax_disp = shared_state.get("ax")
+    canvas_disp = shared_state.get("canvas")
+    if ax_disp is not None:
+        update_fixed_peak_display(
+            ax_disp,
+            canvas_disp,
+            file_name=os.path.basename(file_path),
+            peak_height_uA=peak_height,
+            peak_V=peak_potential,
+            visible=True
+        )
+
+    return peak_height, peak_potential, pot, y_filt, baseline_arr, peak_index
+
+
+def load_normalization_reference():
+    """
+    Charge un SWV de référence, le traite (Hampel + SG + auto-inversion + baseline),
+    calcule la hauteur de pic, l'enregistre et le trace sur la même plage de potentiel que l'UI.
+    """
+    file_path = filedialog.askopenfilename(title="Choose reference SWV ",
+                                           filetypes=[("Text files", "*.txt")])
+    if not file_path:
+        print("❌ No reference file selected.")
+        return
+
+    params = get_current_parameters()
+    if params is None:
+        print("⚠️ Invalid parameters : impossible to calculate reference.")
+        return
+
+    try:
+        # Use the standard pipeline and get arrays back for plotting
+        ref_h, ref_V, pot, y_filt, base_arr, pidx = compute_peak_height_from_file(file_path, params)
+
+        # Stockage référence
+        shared_state["norm_ref_height"] = ref_h
+        shared_state["norm_ref_file"] = file_path
+        shared_state["norm_ref_meta"] = {"peak_V": ref_V}
+        print(f"✅ Normalization ref : {os.path.basename(file_path)} | Height ={ref_h:.6g} µA | Peak at {ref_V:.3f} V")
+
+        if shared_state.get("norm_ref_label_var"):
+            shared_state["norm_ref_label_var"].set(f"Ref: {os.path.basename(file_path)} ({ref_h:.3g} µA)")
+
+        if results:
+            # ✅ Recalculer la normalisation une seule fois
+            recalculate_normalization()
+            shared_state["single_trace_peak"] = {
+                "height_uA": float(ref_h),
+                "peak_V": float(ref_V),
+                "file": os.path.basename(file_path)
+            }
+
+        # === Tracé limité à la plage de potentiel définie dans le GUI ===
+        ax = shared_state.get("ax")
+        canvas = shared_state.get("canvas")
+        if ax is not None and canvas is not None:
+            pot_min, pot_max = params["plage_potentiel"]
+            mask_pot = (pot >= pot_min) & (pot <= pot_max)
+
+            ax.plot(pot[mask_pot], y_filt[mask_pot], color="black", linewidth=1.8, label="Reference")
+            ax.plot(pot[mask_pot], base_arr[mask_pot], "--", color="red", linewidth=1.2, alpha=0.9)
+            ax.scatter(pot[pidx], y_filt[pidx], color="purple", s=60, zorder=5)
+            ax.set_xlim(pot_min, pot_max)
+            ax.relim()
+            ax.autoscale_view(scaley=True)  # keep Y autoscale, X clamped by set_xlim
+            canvas.draw_idle()
+        else:
+            print("ℹ️ Pas d'axe/canvas disponible pour tracer la référence.")
+    except Exception as e:
+        print(f"💥 Error in reference calculation : {e}")
+
+def clear_normalization_reference():
+    shared_state["norm_ref_height"] = None
+    shared_state["norm_ref_file"] = None
+    shared_state["norm_ref_meta"] = None
+    print("ℹ️ Normalization reference deleted; back to index mode.")
+
+    apply_auto = shared_state.get("apply_parameters_auto")
+    if apply_auto is not None:
+        apply_auto()
+
+def find_peak_robust(corrected_signal, potential, peak_range, potential_range,
+                     spike_mask=None, min_width_pts=3, prominence_frac=0.05):
+    """
+    Trouve un pic robuste dans le signal corrigé (courant_filtre - baseline), en évitant
+    les spikes isolés et en imposant une largeur minimale.
+    Retourne l’indice global du pic choisi.
+    """
+    from scipy.signal import find_peaks, medfilt
+    from numpy.polynomial import Polynomial
+
+    y = np.asarray(corrected_signal, dtype=float)
+    pot = np.asarray(potential, dtype=float)
+
+    mask_pot = (pot >= potential_range[0]) & (pot <= potential_range[1])
+    pot_p = pot[mask_pot]
+    y_p = y[mask_pot]
+    idx_global_p = np.nonzero(mask_pot)[0]
+
+    mask_peak = (pot_p >= peak_range[0]) & (pot_p <= peak_range[1])
+    pot_w = pot_p[mask_peak]
+    y_w = y_p[mask_peak]
+    idx_global_w = idx_global_p[np.nonzero(mask_peak)[0]]
+
+    if y_w.size == 0:
+        return int(idx_global_p[int(np.nanargmax(np.abs(y_p)))]) if idx_global_p.size else 0
+
+    # Ignorer les indices "spikes" si fournis
+    if spike_mask is not None and spike_mask.size == y.size:
+        spike_local = spike_mask[idx_global_w]
+    else:
+        spike_local = np.zeros_like(y_w, dtype=bool)
+
+    ymax = np.nanmax(np.abs(y_w)) if np.isfinite(np.nanmax(np.abs(y_w))) else 0.0
+    prom = max(1e-12, prominence_frac * ymax)
+    try:
+        peaks, props = find_peaks(y_w, prominence=prom, distance=2, width=min_width_pts)
+        keep = [i for i in range(len(peaks)) if not spike_local[peaks[i]]]
+        peaks = peaks[keep]
+        if len(peaks) > 0:
+            best_local = peaks[int(np.nanargmax(y_w[peaks]))]
+            return int(idx_global_w[best_local])
+    except Exception:
+        pass
+
+    # Fallback: polynomial sur la fenêtre
+    try:
+        deg = min(5, max(2, len(y_w) - 1))
+        coeffs = np.polyfit(pot_w, y_w, deg)
+        p = Polynomial(coeffs[::-1])
+        roots = p.deriv(1).roots()
+        r_real = roots[np.isreal(roots)].real
+        r_real = r_real[(r_real >= peak_range[0]) & (r_real <= peak_range[1])]
+        if r_real.size > 0:
+            vals = [np.interp(r, pot_w, y_w) for r in r_real]
+            chosen = float(r_real[int(np.nanargmax(vals))])
+            loc = int(np.nanargmin(np.abs(pot_w - chosen)))
+            if not spike_local[loc]:
+                return int(idx_global_w[loc])
+    except Exception:
+        pass
+
+    # Fallback final: median-filter et argmax hors spikes
+    try:
+        y_m = medfilt(y_w, kernel_size=5 if len(y_w) >= 5 else 3)
+        candidates = np.where(~spike_local)[0]
+        if candidates.size > 0:
+            best = candidates[int(np.nanargmax(y_m[candidates]))]
+            return int(idx_global_w[best])
+        else:
+            est = float(np.nanpercentile(y_w, 95))
+            best = int(np.nanargmin(np.abs(y_w - est)))
+            return int(idx_global_w[best])
+    except Exception:
+        best = int(np.nanargmax(y_w))
+        return int(idx_global_w[best])
+
+def compute_file_result(file_path, elapsed_time=None, potential_range=None, peak_range=None,
+                         lam=None, method="ARPLS", polyorder=1, apply_baseline=True,
+                         window_length=11, pos_x=None, pos_y=None):
+    """Calcul PUR : lecture, filtrage, baseline, pic. Ne touche à AUCUN widget Tkinter/matplotlib.
+    Peut donc être appelée en toute sécurité depuis un thread de fond."""
+    if elapsed_time is None:
+        elapsed_time = 0
+    if potential_range is None:
+        potential_range = POTENTIAL_RANGE
+    if peak_range is None:
+        peak_range = PEAK_RANGE
+    if lam is None:
+        lam = LAM
+
+    print(f"📂 Processing : {os.path.basename(file_path)}")
+
+    try:
+        df = lire_donnees(file_path)
+        y_series = (df['Courant (uA)'] if 'Courant (uA)' in df.columns else df.get('Courant inverse (uA)', df.iloc[:, 1])).astype(float)
+        y_raw = y_series.to_numpy()
+        pot = df['Potentiel (V)'].to_numpy()
+
+        # Hampel
+        try:
+            y_hampel, spike_mask = hampel_filter_1d(y_raw, window_size=11, n_sigma=2.5, max_passes=3, use_derivative=True)
+            y_raw = y_hampel
+            repaired_auto = bool(np.any(spike_mask))
+        except Exception as e:
+            print(f"⚠️ Hampel strict indisponible, ignore: {e}")
+            spike_mask = np.zeros_like(y_raw, dtype=bool)
+            repaired_auto = False
+
+        # Auto-inversion
+        mask_pot = (pot >= potential_range[0]) & (pot <= potential_range[1])
+        mask_peak = (pot >= peak_range[0]) & (pot <= peak_range[1])
+        mask_both = mask_pot & mask_peak
+        try:
+            y_window = y_raw[mask_both] if mask_both.any() else (y_raw[mask_pot] if mask_pot.any() else y_raw)
+            invert = (y_window.size > 0 and y_window[np.argmax(np.abs(y_window))] < 0)
+        except Exception as e:
+            print(f"⚠️ Auto-inversion ignorée (raison: {e})")
+            invert = False
+
+        y_used = (-y_raw if invert else y_raw)
+        df['courant_filtre'] = apply_savgol_filter(y_used, window_length=window_length, polyorder=polyorder)
+
+        mask_plot = (df['Potentiel (V)'] >= potential_range[0]) & (df['Potentiel (V)'] <= potential_range[1])
+        df_plot = df[mask_plot] if not df[mask_plot].empty else df
+
+        if not apply_baseline:
+            return {"type": "no_baseline", "file_path": file_path, "df_plot": df_plot}
+
+        # Baseline (avec tri systématique)
+        if method == "ARPLS":
+            baseline, filtered_potential = calculate_baseline_arpls(
+                df['courant_filtre'], df['Potentiel (V)'], potential_range, lam=lam,
+                filename=os.path.basename(file_path)
+            )
+        else:
+            baseline, filtered_potential = calculate_baseline_aSpls(
+                df['courant_filtre'], df['Potentiel (V)'], potential_range, lam=lam,
+                filename=os.path.basename(file_path)
+            )
+
+        order = np.argsort(np.asarray(filtered_potential))
+        interp_baseline = interp1d(
+            np.asarray(filtered_potential)[order], np.asarray(baseline)[order],
+            kind='linear', bounds_error=False, fill_value="extrapolate"
+        )
+        baseline_interpolated = pd.Series(interp_baseline(df['Potentiel (V)'].values), index=df.index)
+
+        is_valid = validate_baseline(df['courant_filtre'], baseline_interpolated)
+        method_used = method
+        if not is_valid:
+            print("⛔ Baseline invalide. Recalcul avec méthode alternative.")
+            if method == "ARPLS":
+                baseline, filtered_potential = calculate_baseline_aSpls(
+                    df['courant_filtre'], df['Potentiel (V)'], potential_range, lam=lam,
+                    filename=os.path.basename(file_path)
+                )
+                method_used = "ASPLS"
+            else:
+                baseline, filtered_potential = calculate_baseline_arpls(
+                    df['courant_filtre'], df['Potentiel (V)'], potential_range, lam=lam,
+                    filename=os.path.basename(file_path)
+                )
+                method_used = "ARPLS"
+            order = np.argsort(np.asarray(filtered_potential))
+            interp_baseline = interp1d(
+                np.asarray(filtered_potential)[order], np.asarray(baseline)[order],
+                kind='linear', bounds_error=False, fill_value="extrapolate"
+            )
+            baseline_interpolated = pd.Series(interp_baseline(df['Potentiel (V)'].values), index=df.index)
+            is_valid = validate_baseline(df['courant_filtre'], baseline_interpolated)
+
+        corrected = df['courant_filtre'] - baseline_interpolated
+        peak_index = find_peak_robust(
+            corrected.values, df['Potentiel (V)'].values, peak_range, potential_range,
+            spike_mask=spike_mask, min_width_pts=3, prominence_frac=0.05
+        )
+        peak_potential = df['Potentiel (V)'].iloc[peak_index]
+        peak_height = float(corrected.iloc[peak_index])
+
+        shared_state["single_trace_peak"] = {
+            "height_uA": peak_height, "peak_V": float(peak_potential),
+            "file": os.path.basename(file_path)
+        }
+        print(f"📍 Peak detected at {peak_potential:.3f} V | Corrected height : {peak_height:.5f} µA")
+
+        if shared_state.get("single_trace_mode", False):
+            peak_var_text = f"Pic: {peak_height:.4f} µA  @ {float(peak_potential):.3f} V"
+        else:
+            peak_var_text = "Pic: —"
+
+        baseline_plot = baseline_interpolated[mask_plot] if mask_plot.any() else baseline_interpolated
+
+        # Positions (logique inchangée)
+        if pos_x is None or pos_y is None:
+            pos_map = shared_state.get("pos_by_file", {})
+            base = os.path.basename(file_path).lower()
+            if base in pos_map:
+                pos_x, pos_y = pos_map[base]
+            elif secm_positions:
+                m = re.search(r"SWV_\((\d+)\)", os.path.basename(file_path))
+                if m:
+                    idx = int(m.group(1))
+                    if 0 <= idx < len(secm_positions):
+                        pos_x = secm_positions[idx].get("X_rel", secm_positions[idx].get("X rel. [µm]"))
+                        pos_y = secm_positions[idx].get("Y_rel", secm_positions[idx].get("Y rel. [µm]"))
+            if (pos_x is None or pos_y is None) and secm_positions and len(results) == 0:
+                pos_x = secm_positions[0].get("X_rel", secm_positions[0].get("X rel. [µm]"))
+                pos_y = secm_positions[0].get("Y_rel", secm_positions[0].get("Y rel. [µm]"))
+
+        row = {
+            "Nom du fichier": os.path.basename(file_path),
+            "Cumulated time (s)": int(elapsed_time),
+            "Position du pic (V)": peak_potential,
+            "Peak height (µA)": peak_height,
+            "X rel. (µm)": pos_x,
+            "Y rel. (µm)": pos_y,
+            "Courant normalisé": None,
+            "Signal change (%)": None,
+            "Baseline correcte": is_valid,
+            "Méthode baseline": method_used,
+            "Auto réparé": repaired_auto
+        }
+
+        return {
+            "type": "full", "file_path": file_path, "df": df, "df_plot": df_plot,
+            "baseline_plot": baseline_plot, "baseline_full": np.asarray(baseline_interpolated, dtype=float),
+            "peak_index": peak_index,
+            "peak_var_text": peak_var_text, "row": row
+        }
+
+    except Exception as e:
+        print(f"💥 Error during process : {e}")
+        return {"type": "error", "file_path": file_path, "message": str(e)}
+
+
+def render_file_result(ax, canvas, payload):
+    """Affichage PUR : tout ce qui touche ax/canvas/status_var/results.
+    Doit TOUJOURS être exécutée depuis le thread principal Tkinter."""
+    file_path = payload["file_path"]
+
+    if payload["type"] == "error":
+        if status_var is not None:
+            status_var.set(f"❌ Error during process of : {os.path.basename(file_path)}")
+        return
+
+    if payload["type"] == "no_baseline":
+        df_plot = payload["df_plot"]
+        ax.plot(df_plot['Potentiel (V)'], df_plot['courant_filtre'], label=os.path.basename(file_path),
+                linewidth=1.2, zorder=3)
+        ax.set_xlabel("Potential (V)")
+        ax.set_ylabel("Current (µA)")
+        ax.set_title("Voltammograms")
+        ax.relim()
+        ax.autoscale_view()
+        canvas.draw()
+        if status_var is not None:
+            status_var.set(f"✅ Fichier tracé (sans baseline) : {os.path.basename(file_path)}")
+        return
+
+    # type == "full"
+    df, df_plot = payload["df"], payload["df_plot"]
+    baseline_plot, peak_index = payload["baseline_plot"], payload["peak_index"]
+
+    ax.plot(df_plot['Potentiel (V)'], df_plot['courant_filtre'], label='_nolegend_')
+    ax.plot(df_plot['Potentiel (V)'], baseline_plot, '--', color='red', linewidth=1.5, zorder=4, label='_nolegend_')
+    ax.scatter(df['Potentiel (V)'].iloc[peak_index], df['courant_filtre'].iloc[peak_index], color='purple', s=60, zorder=5)
+    ax.set_xlabel("Potential (V)")
+    ax.set_ylabel("Current (µA)")
+    canvas.draw_idle()
+
+    update_peak_var_display(ax, canvas, payload["peak_var_text"])
+
+    results.append(payload["row"])
+    # ✅ Recalculer la normalisation une seule fois avec tous les résultats
+    recalculate_normalization()
+
+    if status_var is not None:
+        status_var.set(f"✅ Processed file: {os.path.basename(file_path)}")
+
+
+def process_single_file(file_path, ax, canvas, elapsed_time=None, potential_range=None, peak_range=None,
+                        lam=None, method="ARPLS", polyorder=1, apply_baseline=True, window_length=11,
+                        pos_x=None, pos_y=None):
+    """Version synchrone inchangée (calcul + affichage à la suite) — utilisée uniquement
+    depuis le thread principal (ex: 'Select file')."""
+    payload = compute_file_result(file_path, elapsed_time, potential_range, peak_range, lam,
+                                   method, polyorder, apply_baseline, window_length, pos_x, pos_y)
+    render_file_result(ax, canvas, payload)
+
+
+def process_file_threadsafe(file_path, ax, canvas, elapsed_time=None, potential_range=None, peak_range=None,
+                             lam=None, method="ARPLS", polyorder=1, apply_baseline=True, window_length=11,
+                             pos_x=None, pos_y=None):
+    """Version pour le thread de surveillance : calcule ici (thread de fond),
+    mais délègue tout l'affichage au thread principal via la queue, et ATTEND
+    que ce soit fait avant de continuer (préserve l'ordre exact d'avant)."""
+    payload = compute_file_result(file_path, elapsed_time, potential_range, peak_range, lam,
+                                   method, polyorder, apply_baseline, window_length, pos_x, pos_y)
+    gui_queue.put((ax, canvas, payload))
+    gui_queue.join()
+
+
+def load_secm_positions(file_path=None):
+    """
+    Charge un fichier .dat de positions SECM (Sensolytics).
+    Stocke les coordonnées X, Y et le nom de fichier associé.
+    """
+    global secm_positions
+    if file_path is None:
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Fichiers SECM .dat", "*.dat"), ("Tous fichiers", "*.*")]
+        )
+    if not file_path:
+        print("❌ Aucun fichier de positions sélectionné.")
+        return
+
+    try:
+        with open(file_path, "r", encoding="latin1") as f:
+            lines = f.readlines()
+
+        header_idx = None
+        for i, line in enumerate(lines):
+            ls = line.lstrip()
+            if ls.startswith("#") and (("X rel." in ls and "Y rel." in ls) or ("X [µm]" in ls and "Y [µm]" in ls)):
+                header_idx = i
+                break
+
+        if header_idx is None:
+            print("⚠️ En-tête introuvable dans le fichier .dat")
+            return
+
+        from io import StringIO
+        lines[header_idx] = lines[header_idx].lstrip("#").lstrip()
+        if not lines[header_idx].endswith("\n"):
+            lines[header_idx] += "\n"
+
+        data_str = "".join(lines[header_idx:])
+
+        df = pd.read_csv(
+            StringIO(data_str),
+            sep=",",
+            engine="python",
+            skipinitialspace=True,
+            quotechar='"',
+            escapechar='\\',
+            comment='#',
+            on_bad_lines='skip',
+            skip_blank_lines=True
+        )
+
+        df.columns = [col.strip() for col in df.columns]
+        df.columns = df.columns.str.replace("Âµ", "µ", regex=False)
+
+        def _canon(s: str) -> str:
+            s = s.replace('\xa0', ' ')
+            s = s.strip().lower()
+            s = s.replace('µ', 'u')
+            s = re.sub(r'[\[\]\(\)\.,"“”]', '', s)
+            s = re.sub(r'\s+', ' ', s)
+            return s
+
+        canon_map = {c: _canon(c) for c in df.columns}
+        x_rel_col = next((c for c, cn in canon_map.items() if 'x' in cn and 'rel' in cn), None)
+        y_rel_col = next((c for c, cn in canon_map.items() if 'y' in cn and 'rel' in cn), None)
+
+        if x_rel_col is None or y_rel_col is None:
+            print(f"⚠️ Colonnes X rel. et Y rel. manquantes. Colonnes lues: {list(df.columns)}")
+            return
+
+        last_col = df.columns[-1]
+
+        df["_x_rel_num"] = pd.to_numeric(df[x_rel_col], errors='coerce')
+        df["_y_rel_num"] = pd.to_numeric(df[y_rel_col], errors='coerce')
+        df = df[df["_x_rel_num"].notna() & df["_y_rel_num"].notna()].drop(columns=["_x_rel_num", "_y_rel_num"])
+
+        df.rename(columns={x_rel_col: "X_rel", y_rel_col: "Y_rel", last_col: "File"}, inplace=True)
+
+        # Normaliser la colonne File -> basename en minuscules (clé de jointure robuste)
+        df["File"] = df["File"].astype(str).str.strip().apply(lambda x: os.path.basename(x)).str.lower()
+
+        secm_positions = df[["X_rel", "Y_rel", "File"]].to_dict(orient="records")
+        shared_state["df_secm_positions"] = df[["X_rel", "Y_rel", "File"]].copy()
+        # Mapping direct pour accès rapide
+        shared_state["pos_by_file"] = {row["File"]: (row["X_rel"], row["Y_rel"]) for _, row in df.iterrows()}
+
+        print(f"✅ {len(secm_positions)} SECM positions loaded")
+        if secm_positions:
+            print(f"   Exemple: {secm_positions[0]}")
+
+    except Exception as e:
+        print(f"💥 Erreur lors du chargement du fichier SECM : {e}")
+
+
+
+def run_secm_mapping_dat():
+    global secm_positions
+
+    if not secm_positions:
+        print("⚠️ Aucune position SECM chargée, charge d’abord le fichier .dat")
+        return
+
+    file_paths = filedialog.askopenfilenames(
+        title="Sélectionne les fichiers SWV à associer aux positions (.dat)",
+        filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+    )
+    if not file_paths:
+        print("🚫 Aucun fichier sélectionné")
+        return
+
+    sorted_files = sorted(file_paths, key=lambda f: os.path.getmtime(f))
+    try:
+        selected_dir = os.path.commonpath([os.path.dirname(p) for p in sorted_files])
+    except ValueError:
+        selected_dir = os.path.dirname(sorted_files[0])
+    shared_state["directory"] = selected_dir
+    print(f"📁 Export file : {selected_dir}")
+
+    ax = shared_state.get("ax")
+    canvas = shared_state.get("canvas")
+    if ax is None or canvas is None:
+        print("⚠️ L'UI n'est pas initialisée (ax/canvas manquants). Lance d'abord la fenêtre principale.")
+        return
+
+    params = get_current_parameters()
+    if params is None:
+        print("⚠️ Parameters not valide.")
+        return
+
+    file_times = [os.path.getmtime(f) for f in sorted_files]
+    start_time = file_times[0]
+
+    for idx, file_path in enumerate(sorted_files):
+        if idx < len(secm_positions):
+            pos_x = secm_positions[idx].get("X_rel", secm_positions[idx].get("X rel. [µm]"))
+            pos_y = secm_positions[idx].get("Y_rel", secm_positions[idx].get("Y rel. [µm]"))
+            print(f"📌 {os.path.basename(file_path)} → X={pos_x}, Y={pos_y}")
+            elapsed_time = file_times[idx] - start_time
+
+            process_single_file(
+                file_path,
+                ax,
+                canvas,
+                elapsed_time=elapsed_time,
+                potential_range=params["plage_potentiel"],
+                peak_range=params["position_pic"],
+                lam=params["lambda"],
+                method=params.get("baseline_method", "ARPLS"),
+                polyorder=params.get("polyorder", 1),
+                apply_baseline=True,
+                window_length=params.get("window_length", 11),
+                pos_x=pos_x,
+                pos_y=pos_y
+            )
+        else:
+            print("⚠️ Trop de fichiers SWV par rapport aux positions disponibles.")
+
+
+
+def save_results_to_excel():
+
+    if not results:
+        print("📭 Aucun résultat à sauvegarder.")
+        return
+
+    # 1) DataFrame résultats
+    df_results = pd.DataFrame(results)
+
+    # 2) Préparer une clé de jointure "file_base" (basename normalisé)
+    if "Nom du fichier" not in df_results.columns:
+        print("⚠️ 'Nom du fichier' absent des résultats — sauvegarde interrompue.")
+        return
+
+    df_results["__file_base"] = df_results["Nom du fichier"].astype(str).str.strip().apply(lambda x: os.path.basename(x).lower())
+
+    # 3) Récupérer DataFrame positions si disponible (priorité à shared_state)
+    df_pos = None
+    if shared_state.get("df_secm_positions") is not None:
+        df_pos = shared_state["df_secm_positions"].copy()
+    elif secm_positions:
+        # si seulement la liste est présente, la transformer en DataFrame
+        df_pos = pd.DataFrame(secm_positions)
+
+    if df_pos is not None:
+        # Normaliser noms colonnes possibles -> X_rel, Y_rel, File
+        cols = {c: c for c in df_pos.columns}
+        # méthode tolérante pour identifier colonnes X/Y
+        for c in df_pos.columns:
+            low = c.lower()
+            if "x" in low and "rel" in low:
+                cols[c] = "X_rel"
+            if "y" in low and "rel" in low:
+                cols[c] = "Y_rel"
+            if "file" in low:
+                cols[c] = "File"
+        df_pos = df_pos.rename(columns=cols)
+
+        # S'assurer qu'on a bien X_rel / Y_rel / File
+        if "File" not in df_pos.columns:
+            # tenter la dernière colonne comme fichier (comme dans ton code original)
+            df_pos = df_pos.rename(columns={df_pos.columns[-1]: "File"})
+
+        # normaliser File -> basename lower
+        df_pos["File"] = df_pos["File"].astype(str).str.strip().apply(lambda x: os.path.basename(x).lower())
+
+        # garder uniquement colonnes utiles
+        df_pos = df_pos[["File", "X_rel", "Y_rel"]].copy()
+        # renommer en colonnes destinées dans l'Excel (si tu veux l'affichage exact)
+        df_pos = df_pos.rename(columns={"X_rel": "X_pos_merge", "Y_rel": "Y_pos_merge"})
+
+        # créer clé de jointure
+        df_pos["__file_base"] = df_pos["File"]
+    else:
+        df_pos = None
+
+    # 4) Fusionner (merge) si on a les positions
+    if df_pos is not None:
+        df_final = pd.merge(df_results, df_pos[["__file_base", "X_pos_merge", "Y_pos_merge"]], on="__file_base", how="left")
+    else:
+        df_final = df_results.copy()
+
+    # 5) Remettre des noms conformes pour l'export final
+    # Si tu as déjà des colonnes 'X rel. (µm)' et 'Y rel. (µm)' dans results, on préserve
+    # sinon on crée à partir des colonnes fusionnées
+    if "X rel. (µm)" not in df_final.columns:
+        df_final["X rel. (µm)"] = None
+    if "Y rel. (µm)" not in df_final.columns:
+        df_final["Y rel. (µm)"] = None
+
+    # remplir les X/Y vides depuis la merge (priorité à X rel. (µm) si elle existe déjà)
+    if "X_pos_merge" in df_final.columns:
+        df_final["X rel. (µm)"] = df_final["X rel. (µm)"].fillna(df_final["X_pos_merge"])
+    if "Y_pos_merge" in df_final.columns:
+        df_final["Y rel. (µm)"] = df_final["Y rel. (µm)"].fillna(df_final["Y_pos_merge"])
+
+    # 6) Nettoyage colonnes utilitaires
+    df_final = df_final.drop(columns=[c for c in ["__file_base", "X_pos_merge", "Y_pos_merge", "File"] if c in df_final.columns], errors='ignore')
+
+    # Récuperation des paramètres de Langmuir
+    Vmax = shared_state.get("Vmax_var").get() if shared_state.get("Vmax_var") else 0
+    K = shared_state.get("K_var").get() if shared_state.get("K_var") else 0
+    n = shared_state.get("n_var").get() if shared_state.get("n_var") else 0
+
+    # 7) Optionnel : enlever la colonne "Méthode baseline" des résultats si tu veux (déjà dans Paramètres)
+    if "Méthode baseline" in df_final.columns:
+        df_final = df_final.drop(columns=["Méthode baseline"])
+
+    # 8) Numérotation et écriture fichier Excel
+    df_final.insert(0, 'Numéro', list(range(1, len(df_final) + 1)))
+
+    columns_order = ['Numéro', 'Nom du fichier', 'Cumulated time (s)', 'Position du pic (V)',
+                     'Peak height (µA)', 'X rel. (µm)', 'Y rel. (µm)',
+                     'Courant normalisé', 'Signal change (%)', 'Concentration_calc (M)',
+                     'Baseline correcte']
+
+    # Ne garder que les colonnes qui existent dans le DataFrame
+    existing_columns = [col for col in columns_order if col in df_final.columns]
+    # Ajouter les colonnes qui n'étaient pas dans notre liste prédéfinie
+    remaining_columns = [col for col in df_final.columns if col not in columns_order]
+    # Réorganiser le DataFrame
+    df_final = df_final[existing_columns + remaining_columns]
+
+    directory = shared_state.get("directory") or os.getcwd()
+    base_filename = 'resultats_voltammogrammes.xlsx'
+    default_path = os.path.join(directory, base_filename)
+    counter = 1
+    while os.path.exists(default_path):
+        default_path = os.path.join(directory, f'resultats_voltammogrammes_{counter}.xlsx')
+        counter += 1
+
+    output_path = filedialog.asksaveasfilename(
+        title="Enregistrer les résultats sous...",
+        initialdir=directory,
+        initialfile=os.path.basename(default_path),
+        defaultextension=".xlsx",
+        filetypes=[("Fichiers Excel", "*.xlsx"), ("Tous les fichiers", "*.*")]
+    )
+
+    if not output_path:
+        print("❌ Export canceled")
+        return
+
+        # Création du fichier Excel avec xlsxwriter pour pouvoir insérer des formules
+    with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+            # Écrire les données brutes d'abord
+            df_final.to_excel(writer, sheet_name='Résultats', index=False)
+
+            # Récupérer les objets workbook et worksheet
+            workbook = writer.book
+            worksheet = writer.sheets['Résultats']
+
+            # Formats personnalisés
+            format_standard = workbook.add_format()
+            format_gain = workbook.add_format({'num_format': '0.00'})  # 2 décimales
+            format_courant = workbook.add_format({'num_format': '0.000'})  # 3 décimales
+            format_concentration = workbook.add_format({'num_format': '0.00E+00'})  # Notation scientifique
+
+            # Récupérer l'indice de normalisation
+            norm_idx = shared_state.get("last_parameters", {}).get("normalisation_index", 4)
+
+            # Obtenir les indices des colonnes (basés sur les en-têtes)
+            headers = list(df_final.columns)
+
+            # Trouver l'indice de la colonne 'Hauteur du pic (µA)'
+            hauteur_pic_col = next((i for i, col in enumerate(headers) if col == 'Peak height (µA)'), None)
+            if hauteur_pic_col is None:
+                print("⚠️ Colonne 'Peak height (µA)' non trouvée. Impossible d'écrire les formules.")
+                return
+
+            # Convertir en lettre Excel (A, B, C, ...)
+            hauteur_col_letter = chr(65 + hauteur_pic_col)
+
+            # Référence index GUI (pour fallback)
+            ref_row = norm_idx + 2  # Excel: 1-based + en-tête
+            ref_cell = f"{hauteur_col_letter}{ref_row}"
+
+            # Paramètres cachés pour Excel (une seule fois)
+            worksheet.write('AA1', Vmax)  # Vmax (%)
+            worksheet.write('AA2', K)     # K (M)
+            worksheet.write('AA3', n)     # n
+            norm_ref_h = shared_state.get("norm_ref_height") or 0
+            worksheet.write('AA4', norm_ref_h)  # Référence externe (µA), 0 si absente
+
+            # Écrire les formules par colonne
+            for col_idx, col_name in enumerate(headers):
+                col_letter = chr(65 + col_idx)
+
+                if col_name == 'Courant normalisé':
+                    worksheet.set_column(col_idx, col_idx, 15, format_courant)
+                    for row_idx in range(len(df_final)):
+                        excel_row = row_idx + 2  # 1 ligne d'en-tête + 1-based
+                        # IF($AA$4>0, Hauteur/AA4, Hauteur/refCell)
+                        formula = f'=IF($AA$4>0,{hauteur_col_letter}{excel_row}/$AA$4,{hauteur_col_letter}{excel_row}/{ref_cell})'
+                        worksheet.write_formula(excel_row - 1, col_idx, formula, format_courant)
+
+                elif col_name == 'Signal change (%)':
+                    courant_norm_col = next((i for i, name in enumerate(headers) if name == 'Courant normalisé'), None)
+                    if courant_norm_col is None:
+                        continue
+                    courant_norm_letter = chr(65 + courant_norm_col)
+                    worksheet.set_column(col_idx, col_idx, 12, format_gain)
+                    for row_idx in range(len(df_final)):
+                        excel_row = row_idx + 2
+                        formula = f'=({courant_norm_letter}{excel_row}-1)*100'
+                        worksheet.write_formula(excel_row - 1, col_idx, formula, format_gain)
+
+                elif col_name == 'Concentration_calc (M)':
+                    gain_col = next((i for i, name in enumerate(headers) if name == 'Signal change (%)'), None)
+                    if gain_col is None:
+                        continue
+                    gain_letter = chr(65 + gain_col)
+                    worksheet.set_column(col_idx, col_idx, 20, format_concentration)
+                    for row_idx in range(len(df_final)):
+                        excel_row = row_idx + 2
+                        # C = K * ( |G/(Vmax-G)| )^(1/n) avec K=AA2, Vmax=AA1, n=AA3
+                        formula = f'=$AA$2*(ABS({gain_letter}{excel_row}/($AA$1-{gain_letter}{excel_row}))^(1/$AA$3))'
+                        worksheet.write_formula(excel_row - 1, col_idx, formula, format_concentration)
+
+
+            param_sheet = workbook.add_worksheet("Paramètres")
+
+            params = shared_state.get("last_parameters", {
+                "plage_potentiel": POTENTIAL_RANGE,
+                "position_pic": PEAK_RANGE,
+                "lambda": LAM,
+                "polyorder": POLYORDER,
+                "window_length": SAVGOL_WINDOW,
+            })
+
+            # Écriture des paramètres
+            param_sheet.write('A1', 'Lambda')
+            param_sheet.write('B1', params["lambda"])
+            param_sheet.write('A2', 'Plage potentiel (V)')
+            param_sheet.write('B2', f'{params["plage_potentiel"][0]} à {params["plage_potentiel"][1]}')
+            param_sheet.write('A3', 'Plage pic (V)')
+            param_sheet.write('B3', f'{params["position_pic"][0]} à {params["position_pic"][1]}')
+            param_sheet.write('A4', 'Méthode baseline')
+            param_sheet.write('B4', params.get("baseline_method", "ARPLS"))
+            param_sheet.write('A5', 'Savitzky-Golay - Polyorder')
+            param_sheet.write('B5', params.get("polyorder", 1))
+            param_sheet.write('A6', 'Savitzky-Golay - Fenêtre')
+            param_sheet.write('B6', params.get("window_length", 11))
+
+            # Section Langmuir-Hill
+            param_sheet.write('A8', 'Paramètres Langmuir-Hill')
+            param_sheet.write('A9', 'Vmax (%)')
+            param_sheet.write('B9', Vmax)
+            param_sheet.write('A10', 'K (M)')
+            param_sheet.write('B10', K)
+            param_sheet.write('A11', 'n')
+            param_sheet.write('B11', n)
+
+            # Documentation des formules
+            param_sheet.write('A13', 'Formule courant normalisé:')
+            param_sheet.write('B13', '= Hauteur_pic / Hauteur_pic_ref')
+            param_sheet.write('A14', 'Formule gain (%):')
+            param_sheet.write('B14', '= (Courant_normalisé - 1) * 100')
+            param_sheet.write('A15', 'Formule concentration:')
+            param_sheet.write('B15', 'C = K * (|G/(Vmax-G)|)^(1/n)')
+            param_sheet.write('A16', 'Réf normalisation (µA)')
+            param_sheet.write('B16', norm_ref_h)
+            if shared_state.get("norm_ref_file"):
+                param_sheet.write('A17', 'Fichier référence')
+                param_sheet.write('B17', os.path.basename(shared_state["norm_ref_file"]))
+
+    try:
+            from openpyxl import load_workbook
+            from openpyxl.chart import LineChart, Reference
+
+            # Rouvrir le fichier avec openpyxl (pour ajouter le graphique)
+            wb = load_workbook(output_path)
+            ws = wb['Résultats']
+
+            # Déterminer le nombre de lignes avec données
+            num_rows = len(df_final)
+
+            # Créer les références pour le graphique
+            # Colonne C = "Temps cumulé (s)" (X)
+            # Colonne I = "Gain (%)" (Y)
+            categories = Reference(ws, min_col=3, min_row=2, max_row=num_rows + 1)  # Colonne C (Temps)
+            values = Reference(ws, min_col=9, min_row=1, max_row=num_rows + 1)  # Colonne I (Gain)
+
+            # Créer le graphique
+            chart = LineChart()
+            chart.title = "Signal change (%) vs time"
+            chart.style = 12
+            chart.y_axis.title = "Signal change (%)"
+            chart.x_axis.title = "Cumulated time (s)"
+            chart.height = 10  # hauteur en cm
+            chart.width = 18  # largeur en cm
+            chart.add_data(values, titles_from_data=True)
+            chart.set_categories(categories)
+
+            # Ajouter le graphique à la position P4
+            ws.add_chart(chart, "P4")
+
+            # Sauvegarder
+            wb.save(output_path)
+    except Exception as e:
+            print(f"⚠️ Erreur lors de l'ajout du graphique : {e}")
+
+    print(f"💾 Results saved in : {output_path}")
+
+def get_current_parameters():
+    """Récupère les paramètres directement depuis le GUI (Variables Tkinter)."""
+    try:
+        bm_var = shared_state.get("baseline_method_var")
+        baseline_method = bm_var.get() if bm_var is not None else "ARPLS"
+
+        params = {
+            "plage_potentiel": (
+                float(shared_state["potential_min_var"].get()),
+                float(shared_state["potential_max_var"].get())
+            ),
+            "position_pic": (
+                float(shared_state["peak_min_var"].get()),
+                float(shared_state["peak_max_var"].get())
+            ),
+            "lambda": float(shared_state["lambda_var"].get()),
+            "baseline_method": baseline_method,
+            "polyorder": int(shared_state["polyorder_var"].get()),
+            "window_length": int(shared_state["window_length_var"].get()),
+            "normalisation_index": shared_state["normalization_index_var"].get() - 1
+        }
+
+        shared_state["last_parameters"] = params
+        return params
+
+    except ValueError:
+        print("⚠️ Erreur lors de la récupération des paramètres (valeur vide ou invalide).")
+        return None
+
+
+def recalculate_normalization():
+    """
+    Recalcule la normalisation pour TOUS les résultats en mémoire UNE SEULE FOIS.
+    Appelée uniquement quand la référence ou l'index change.
+    """
+    if not results:
+        return
+
+    ref_h_external = shared_state.get("norm_ref_height")
+    norm_index = shared_state.get("last_parameters", {}).get("normalisation_index", 4)
+
+    # Déterminer la référence à utiliser
+    if ref_h_external and ref_h_external > 0:
+        # Priorité à la référence externe
+        ref_value = float(ref_h_external)
+        #print(f"🔢 Normalisation appliquée (ref externe) = {ref_value:.6g} µA pour {len(results)} résultats")
+    elif 0 <= norm_index < len(results):
+        # Fallback : index choisi dans l'UI
+        ref_value = results[norm_index]["Peak height (µA)"]
+        if not ref_value or ref_value == 0:
+            print(f"⚠️ Index {norm_index} non valide (None ou 0). Impossible to apply normalization")
+            return
+        #print(f"🔢 Normalisation appliquée (index {norm_index}) = {ref_value:.6g} µA pour {len(results)} résultats")
+    else:
+        #print(f"⚠️ Index of normalization ({norm_index}) beyond limits (n={len(results)}). Normalization impossible.")
+        return
+
+    # Recalculer TOUS les résultats une seule fois
+    for res in results:
+        h = res.get("Peak height (µA)")
+        if h is not None and ref_value and ref_value > 0:
+            res["Courant normalisé"] = h / ref_value
+            res["Signal change (%)"] = (res["Courant normalisé"] - 1.0) * 100.0
+
+def open_help_window():
+    """Ouvre une fenêtre avec la notice d'utilisation (anglais)."""
+    help_window = tk.Toplevel()
+    help_window.title("HELP - User Guide")
+    help_window.geometry(HELP_WINDOW_SIZE)
+
+    # === Frame principal avec scrollbar ===
+    main_frame = ttk.Frame(help_window)
+    main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+    # Canvas + Scrollbar pour défilable
+    canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
+    scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = ttk.Frame(canvas, padding=15)
+
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    # === CONTENU DE L'AIDE (EN ANGLAIS) ===
+    help_text = """SQUAREWAVE VOLTAMMETRY (SWV) ANALYSIS - USER GUIDE
+
+BASIC WORKFLOW
+
+[1] CONFIGURE PARAMETERS (Left panel)
+    - Baseline Method: ARPLS or ASPLS
+      Choose the algorithm for baseline subtraction
+
+    - Potential Range (V): e.g. -0.42 to -0.10
+      Analysis interval for the data
+
+    - Peak Range (V): e.g. -0.30 to -0.23
+      Zone where the main peak should be searched
+
+    - Lambda (λ): e.g. 1e5
+      Smoothing parameter (higher = smoother)
+
+    - Savitzky-Golay Filter
+      - Order: 1 (linear) or 2 (polynomial)
+      - Window: 11 (size of filtering window)
+
+    - Normalization Point: e.g. 5
+      Which file to use as reference (5th file = index 5)
+
+
+[2] LOAD A REFERENCE (Optional)
+    - Click "Charger SWV de reference" to select a .txt file
+    - The peak height becomes the reference for GAIN calculation
+    - RECOMMENDED for comparison with external standard
+    - Without reference: uses the normalization point instead
+
+
+[3] PROCESS FILES (3 modes)
+
+    Mode A: Folder Monitoring
+    - Click "Choisir un dossier"
+    - Software automatically processes each new .txt file
+    - Best for: real-time acquisition
+
+    Mode B: Manual Selection (RECOMMENDED for beginners)
+    - Click "Selectionner fichiers"
+    - Choose files to process
+    - Best for: processing a known set of files
+
+    Mode C: Plot Raw Data (no baseline)
+    - Click "Tracer brut (non filtre)"
+    - Plot data without correction
+    - Best for: diagnosis, before/after comparison
+
+
+[4] VIEW RESULTS
+    - Real-time graph (right side)
+    - Each curve = one file
+    - Red point = detected baseline
+    - Purple point = detected peak
+    - Peak height displayed (bottom right)
+
+
+[5] EXPORT RESULTS
+    - Click "Exporter sous Excel" (BLUE button)
+    - File created: resultats_voltammogrammes.xlsx
+    - Contains:
+      - Sheet "Resultats": raw data + calculated formulas
+        * Number, Filename, Elapsed time
+        * Peak position (V), Peak height (µA)
+        * Normalized current, Signal change (%)
+        * Concentration (Langmuir-Hill formula)
+        * Gain vs Time graph (position P4)
+      - Sheet "Parametres": parameters used + documentation
+
+
+[6] LANGMUIR-HILL CALIBRATION PARAMETERS
+    - Vmax (%): maximum saturation
+    - K (M): dissociation constant
+    - n: Hill coefficient
+    - Formula: C = K × |G/(Vmax-G)|^(1/n)
+
+
+[7] SECM MAPS (Optional - for spatial data)
+    - "Load SECM positions" -> import .dat file with XY coordinates
+    - "Process SECM (.dat)" -> process files in correct order
+    - "Display SECM map" -> visualize:
+      * Raw height (µA)
+      * Signal change (%) - with reference
+      * Concentration (M) - linear or log scale
+
+
+[8] DISPLAY GAIN IN REAL-TIME
+    - Click "Display signal change"
+    - Pop-up window: Signal change (%) vs Time graph
+    - Updates automatically every 2 seconds
+
+
+ADVANCED PARAMETERS & TIPS
+
+Baseline Selection (ARPLS vs ASPLS)
+- ARPLS: more rigid, good for sharp peaks
+- ASPLS: more flexible, good for noisy signals
+
+Lambda (λ)
+- Low value (1e3): less smooth, follows data
+- High value (1e6): very smooth, risk of error
+- Default (1e5): good compromise
+
+Savitzky-Golay Filter
+- Order 1: light smoothing (RECOMMENDED)
+- Order 2: more aggressive smoothing
+- Window: size of moving average (11 = good default)
+
+Normalization
+- Index-based: uses Nth file as reference
+- External: load reference file from disk (BETTER)
+
+
+BEST PRACTICES
+
+DO's:
+- Load an external reference if possible (better precision)
+- Test parameters on a few files first
+- Export regularly (WARNING at +100 results)
+- Check Gain vs Time graph (look for anomalies)
+- Use "Charger positions SECM" for spatial mapping
+
+DON'Ts:
+- Do NOT change parameters during processing
+- Do NOT reset without exporting (data will be lost!)
+- Do NOT use very low Lambda (baseline calculation fails)
+
+
+AUTOMATIC WARNINGS
+
+- At 100 results: save reminder
+- Invalid baseline: automatic fallback to other method
+- Spikes detected: automatic correction applied
+
+
+INPUT FILE FORMATS
+
+SWV Files (.txt)
+- Formats: EC-Lab, Autolab, or CHI
+- Columns: Potential (V) | Current (µA or A)
+- Separator: TAB or space
+
+SECM Files (.dat)
+- Format: Sensolytics
+- Columns: X rel. (µm) | Y rel. (µm) | Filename
+- Format: CSV with tabulation
+
+
+QUICK TROUBLESHOOTING
+
+"Baseline invalide. Recalcul..."
+-> Solution: Increase Lambda a bit (e.g. 1e5 -> 2e5)
+
+Peak not detected
+-> Solution: Check peak range and lambda values
+
+Files processing slowly (+200 files)
+-> Solution: This is normal, software is already optimized
+
+
+Version: 1.0
+Last Updated: 2026
+"""
+
+    # Afficher le texte dans un Label (Courier pour alignement)
+    label = ttk.Label(
+        scrollable_frame,
+        text=help_text,
+        font=("Courier", 9),
+        justify="left",
+        background="white"
+    )
+    label.pack(fill="both", expand=True)
+
+    # Packer canvas et scrollbar
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    # Bouton fermeture
+    close_button = ttk.Button(help_window, text="Close", command=help_window.destroy)
+    close_button.pack(pady=10)
+
+def start_realtime_display():
+    global root, status_var
+    root = Tk()
+    status_var = StringVar()
+    status_var.set("🔄 Ready to start.")
+    root.title("Echem data analysis + SECM")
+    root.geometry(MAIN_WINDOW_SIZE)
+
+
+    # === PARAMÈTRES PRÉDÉFINIS ===
+    params = {
+        "plage_potentiel_min": POTENTIAL_RANGE[0],
+        "plage_potentiel_max": POTENTIAL_RANGE[1],
+        "position_pic_min": PEAK_RANGE[0],
+        "position_pic_max": PEAK_RANGE[1],
+        "lambda": LAM,
+    }
+
+    # --- Styles personnalisés ---
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("Blue.TButton", foreground="white", background="#337ab7")
+    style.map("Blue.TButton",
+              background=[('active', '#23527c'), ('disabled', '#e6e6e6')])
+    style.configure("Green.TButton", foreground="white", background="#5cb85c")
+    style.map("Green.TButton",
+              background=[('active', '#449d44'), ('disabled', '#e6e6e6')])
+    style.configure("Danger.TButton", foreground="white", background="#d9534f")
+    style.map("Danger.TButton", background=[('active', '#c9302c'), ('disabled', '#e6e6e6')])
+
+
+    # === SECTION POUR LES PARAMÈTRES ===
+    param_frame = ttk.Frame(root, padding=10)
+    param_frame.pack(side="left", fill="y")
+    param_frame.config(width=0)
+
+    ttk.Label(param_frame, text="Parameter configuration", font=("Arial", 12, "bold")).pack(pady=10)
+
+    ttk.Label(param_frame, text="Baseline method :").pack(anchor="w")
+    baseline_method_var = StringVar(value="ARPLS")
+    baseline_menu = ttk.Combobox(param_frame, textvariable=baseline_method_var, values=["ARPLS", "ASPLS"], state="readonly")
+    baseline_menu.pack(fill="x", pady=5)
+    shared_state["baseline_method_var"] = baseline_method_var
+
+    ttk.Label(param_frame, text="Potential window (V) :").pack(anchor="w")
+    potential_frame = ttk.Frame(param_frame)
+    potential_frame.pack(fill="x", pady=5)
+
+    shared_state["potential_min_var"] = tk.DoubleVar(value=params["plage_potentiel_min"])
+    shared_state["potential_max_var"] = tk.DoubleVar(value=params["plage_potentiel_max"])
+
+    potential_min_entry = ttk.Entry(potential_frame, textvariable=shared_state["potential_min_var"], width=10)
+    potential_max_entry = ttk.Entry(potential_frame, textvariable=shared_state["potential_max_var"], width=10)
+    potential_min_entry.pack(side="left", padx=5)
+    potential_max_entry.pack(side="left", padx=5)
+
+    ttk.Label(param_frame, text="Lambda :").pack(anchor="w")
+    shared_state["lambda_var"] = tk.DoubleVar(value=params["lambda"])
+    lambda_entry = ttk.Entry(param_frame, textvariable=shared_state["lambda_var"])
+    lambda_entry.pack(fill="x", pady=5)
+
+    ttk.Label(param_frame, text="Peak window (V) :").pack(anchor="w")
+    peak_frame = ttk.Frame(param_frame)
+    peak_frame.pack(fill="x", pady=5)
+
+    shared_state["peak_min_var"] = tk.DoubleVar(value=params["position_pic_min"])
+    shared_state["peak_max_var"] = tk.DoubleVar(value=params["position_pic_max"])
+
+    peak_min_entry = ttk.Entry(peak_frame, textvariable=shared_state["peak_min_var"], width=10)
+    peak_max_entry = ttk.Entry(peak_frame, textvariable=shared_state["peak_max_var"], width=10)
+    peak_min_entry.pack(side="left", padx=5)
+    peak_max_entry.pack(side="left", padx=5)
+
+    ttk.Label(param_frame, text="Normalization point (ex: 5 for 5th value) :", wraplength=180).pack(anchor="w")
+    shared_state["normalization_index_var"] = tk.IntVar(value=5)
+    normalization_index_entry = ttk.Entry(param_frame, textvariable=shared_state["normalization_index_var"])
+    normalization_index_entry.pack(fill="x", pady=5)
+    shared_state["normalization_index_entry"] = normalization_index_entry
+
+    # Label état référence
+    shared_state["norm_ref_label_var"] = tk.StringVar(value="Ref: none")
+    ttk.Label(param_frame, textvariable=shared_state["norm_ref_label_var"]).pack(anchor="w", pady=(6, 0))
+
+    # Boutons pour charger/effacer la référence externe
+    ttk.Button(param_frame, text="Load reference SWV", command=load_normalization_reference).pack(fill="x", pady=4)
+    ttk.Button(param_frame, text="Delete reference", command=clear_normalization_reference).pack(fill="x", pady=2)
+
+    # === Paramètres de calibration Langmuir-Hill ===
+    ttk.Label(param_frame, text="Calibration Langmuir-Hill", font=("Arial", 10, "bold")).pack(anchor="w", pady=(10, 0))
+
+    shared_state["Vmax_var"] = tk.DoubleVar(value=119.91063)
+    shared_state["K_var"] = tk.DoubleVar(value=3.98E-07)
+    shared_state["n_var"] = tk.DoubleVar(value=0.97854)
+
+    calib_frame = ttk.Frame(param_frame)
+    calib_frame.pack(fill="x", pady=2)
+
+    ttk.Label(calib_frame, text="Vmax").grid(row=0, column=0, sticky="w")
+    ttk.Entry(calib_frame, textvariable=shared_state["Vmax_var"], width=8).grid(row=0, column=1, padx=4)
+
+    ttk.Label(calib_frame, text="K").grid(row=0, column=2, sticky="w")
+    ttk.Entry(calib_frame, textvariable=shared_state["K_var"], width=8).grid(row=0, column=3, padx=4)
+
+    ttk.Label(calib_frame, text="n").grid(row=0, column=4, sticky="w")
+    ttk.Entry(calib_frame, textvariable=shared_state["n_var"], width=8).grid(row=0, column=5, padx=4)
+
+    # --- Application automatique du point de normalisation (sans bouton) ---
+    _auto_apply_after_id = {"id": None}
+
+    def apply_parameters_auto(*_args):
+        try:
+            # UI user-facing value (1-based) -> internal index (0-based)
+            ui_idx = int(shared_state["normalization_index_var"].get())
+            ref_index = max(0, ui_idx - 1)
+
+            # Met à jour last_parameters pour que les autres fonctions lisent le bon index
+            shared_state.setdefault("last_parameters", {})["normalisation_index"] = ref_index
+
+            # Sauvegarde immédiate des paramètres Langmuir-Hill
+            Vmax_val = float(shared_state["Vmax_var"].get())
+            K_val = float(shared_state["K_var"].get())
+            n_val = float(shared_state["n_var"].get())
+            shared_state["last_parameters"].update({"Vmax": Vmax_val, "K": K_val, "n": n_val})
+
+            if not results:
+                return
+
+            # ✅ Recalculer la normalisation
+            recalculate_normalization()
+            print(f"✅ Normalisation mise à jour (index UI = {ui_idx})")
+
+            # === Tracer le voltamogramme du point choisi comme référence ===
+            if 0 <= ref_index < len(results):
+                filename = results[ref_index]["Nom du fichier"]
+                directory = shared_state.get("directory") or os.getcwd()
+                file_path = os.path.join(directory, filename)
+
+                params_ref = get_current_parameters()
+                if params_ref is not None and os.path.isfile(file_path):
+                    ref_h, ref_V, pot, y_filt, base_arr, pidx = compute_peak_height_from_file(file_path, params_ref)
+
+                    ax = shared_state.get("ax")
+                    canvas = shared_state.get("canvas")
+                    if ax is not None and canvas is not None:
+                        # Retirer les anciens tracés de référence avant d'en dessiner un nouveau
+                        for artist in shared_state.get("ref_plot_artists", []):
+                            try:
+                                artist.remove()
+                            except Exception:
+                                pass
+                        shared_state["ref_plot_artists"] = []
+
+                        pot_min, pot_max = params_ref["plage_potentiel"]
+                        mask_pot = (pot >= pot_min) & (pot <= pot_max)
+
+                        line1, = ax.plot(pot[mask_pot], y_filt[mask_pot], color="black", linewidth=1.8)
+                        line2, = ax.plot(pot[mask_pot], base_arr[mask_pot], "--", color="red", linewidth=1.2, alpha=0.9)
+                        scat = ax.scatter(pot[pidx], y_filt[pidx], color="purple", s=60, zorder=5)
+                        shared_state["ref_plot_artists"] = [line1, line2, scat]
+
+                        ax.set_xlim(pot_min, pot_max)
+                        ax.relim()
+                        ax.autoscale_view(scaley=True)
+                        canvas.draw_idle()
+
+                    print(f"📈 Référence (index {ui_idx}) affichée : {filename} | Hauteur = {ref_h:.4g} µA")
+
+        except Exception as e:
+            print(f"⚠️ Erreur lors de l'application automatique du point de normalisation : {e}")
+
+    shared_state["apply_parameters_auto"] = apply_parameters_auto
+
+    def _schedule_apply_parameters(*_args):
+        if _auto_apply_after_id["id"] is not None:
+            try:
+                root.after_cancel(_auto_apply_after_id["id"])
+            except Exception:
+                pass
+        _auto_apply_after_id["id"] = root.after(500, apply_parameters_auto)
+
+    shared_state["normalization_index_var"].trace_add("write", _schedule_apply_parameters)
+    shared_state["Vmax_var"].trace_add("write", _schedule_apply_parameters)
+    shared_state["K_var"].trace_add("write", _schedule_apply_parameters)
+    shared_state["n_var"].trace_add("write", _schedule_apply_parameters)
+
+
+    ttk.Label(param_frame, text="Order of Savitzky-Golay :").pack(anchor="w")
+    shared_state["polyorder_var"] = tk.IntVar(value=1)
+    polyorder_entry = ttk.Entry(param_frame, textvariable=shared_state["polyorder_var"])
+    polyorder_entry.pack(fill="x", pady=5)
+
+    ttk.Label(param_frame, text="Window of Savitzky-Golay :").pack(anchor="w")
+    shared_state["window_length_var"] = tk.IntVar(value=11)
+    window_length_entry = ttk.Entry(param_frame, textvariable=shared_state["window_length_var"])
+    window_length_entry.pack(fill="x", pady=5)
+
+    help_button_frame = ttk.Frame(param_frame)
+    help_button_frame.pack(fill="x", pady=(15, 5))
+    ttk.Button(help_button_frame, text="HELP", command=open_help_window).pack(fill="x")
+
+    # === CRÉER UN FRAME POUR LES LOGS ===
+    logs_frame = ttk.LabelFrame(root, text="Activity Logs", padding=5)
+    logs_frame.pack(side="bottom", fill="both", expand=False, padx=10, pady=5)
+    logs_frame.grid_columnconfigure(0, weight=1)
+    logs_frame.grid_rowconfigure(0, weight=1)
+
+    # Widget Text pour les logs (police améliorée)
+    logs_text = tk.Text(
+        logs_frame,
+        height=LOG_TEXT_HEIGHT,
+        width=LOG_TEXT_WIDTH,
+        font=("Consolas", 11),
+        bg="#1e1e1e",
+        fg="#00ff00",
+        insertbackground="#00ff00",
+        padx=8,
+        pady=5
+    )
+    logs_text.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+    # Scrollbar pour les logs
+    logs_scrollbar = ttk.Scrollbar(logs_frame, orient="vertical", command=logs_text.yview)
+    logs_scrollbar.grid(row=0, column=1, sticky="ns")
+    logs_text.config(yscrollcommand=logs_scrollbar.set)
+
+    # Bouton "Clear Logs"
+    def clear_logs():
+        logs_text.delete("1.0", "end")
+
+    ttk.Button(logs_frame, text="Clear Logs", command=clear_logs).grid(row=1, column=0, sticky="e", padx=5, pady=2)
+
+    # Rediriger sys.stdout vers le widget (IMPORTANT)
+    import sys
+    sys.stdout = LogCapture(logs_text)
+
+    # === CONTENEUR POUR LE GRAPHIQUE + TOOLBAR ===
+    frame_graphique = ttk.Frame(root)
+    frame_graphique.pack(side="right", fill="y")
+    frame_graphique.config(width=700)
+
+    fig = Figure(figsize=MAIN_FIGSIZE)
+    ax = fig.add_subplot(111)
+    canvas = FigureCanvasTkAgg(fig, master=frame_graphique)
+    shared_state["ax"] = ax
+    shared_state["canvas"] = canvas
+    canvas_widget = canvas.get_tk_widget()
+    canvas_widget.pack(fill="both", expand=True)
+    toolbar = NavigationToolbar2Tk(canvas, frame_graphique)
+    toolbar.update()
+    toolbar.pack(side="bottom", fill="x")
+
+
+    set_format_coord_xy(ax)
+    _ensure_peak_text_artist(ax)  # crée le texte fixe (vide au début)
+
+    def poll_gui_queue():
+        try:
+            while True:
+                ax_q, canvas_q, payload = gui_queue.get_nowait()
+                render_file_result(ax_q, canvas_q, payload)
+                gui_queue.task_done()
+        except queue.Empty:
+            pass
+        root.after(50, poll_gui_queue)
+
+    poll_gui_queue()
+
+
+    # === DÉFINITIONS DES FONCTIONS INTERNES ===
+
+    def process_file_with_parameters(file_path, elapsed_time):
+        global status_var
+        current_params = get_current_parameters()
+        if status_var is not None:
+            status_var.set(f"📂 Processing : {os.path.basename(file_path)}")
+        if current_params is None:
+            print("❌ Impossible de traiter le fichier : paramètres invalides.")
+            return
+
+        process_single_file(
+            file_path,
+            ax,
+            canvas,
+            elapsed_time,
+            potential_range=current_params["plage_potentiel"],
+            peak_range=current_params["position_pic"],
+            lam=current_params["lambda"],
+            method=current_params["baseline_method"],
+            polyorder=current_params["polyorder"],
+            apply_baseline=True,
+            window_length=current_params["window_length"]
+        )
+
+    def process_file_with_parameters_bg(file_path, elapsed_time):
+        current_params = get_current_parameters()
+        root.after(0, lambda: status_var.set(f"📂 Processing : {os.path.basename(file_path)}") if status_var else None)
+        if current_params is None:
+            print("❌ Impossible de traiter le fichier : paramètres invalides.")
+            return
+
+        process_file_threadsafe(
+            file_path, ax, canvas, elapsed_time,
+            potential_range=current_params["plage_potentiel"],
+            peak_range=current_params["position_pic"],
+            lam=current_params["lambda"],
+            method=current_params["baseline_method"],
+            polyorder=current_params["polyorder"],
+            apply_baseline=True,
+            window_length=current_params["window_length"]
+        )
+
+    def launch_monitor():
+        directory = filedialog.askdirectory()
+
+        if shared_state.get("monitor_running"):
+            print("⚠️ Une surveillance est déjà en cours. Arrêtez-la avant d'en lancer une nouvelle.")
+            return
+
+        if directory:
+            shared_state["directory"] = directory
+            shared_state["stop"] = False
+            shared_state["monitor_running"] = True
+            shared_state["single_trace_mode"] = True
+            Thread(target=monitor_directory, args=(directory, process_file_with_parameters_bg, shared_state),
+                   daemon=True).start()
+            print(f"📁 Selected file : {directory}")
+
+
+
+    def process_selected_files():
+        file_paths = filedialog.askopenfilenames(filetypes=[("Text files", "*.txt")])
+        if not file_paths:
+            print("❌ Aucun fichier sélectionné.")
+            return
+
+        selected_dir = os.path.dirname(file_paths[0])
+        shared_state["directory"] = selected_dir
+
+        # Single trace mode si 1 seul fichier choisi
+        shared_state["single_trace_mode"] = (len(file_paths) == 1)
+        if not shared_state["single_trace_mode"]:
+            # on masque le pic si superposition
+            update_peak_var_display(ax, canvas, "Pic: —")
+
+        for i, file_path in enumerate(file_paths):
+            process_file_with_parameters(file_path, elapsed_time=i * 2)
+
+    def export_to_excel():
+        save_results_to_excel()
+
+    def reset_button_action():
+        reset_application(ax, canvas)
+
+    def stop_processing():
+        shared_state["stop"] = True
+        print("⏸️ Processing stopped.")
+
+    def show_gain_window():
+        global shared_state, root
+        if len(results) < 5:
+            print("You need at least 5 s to display signal change.")
+            return
+        if not shared_state.get("gain_window_open", False):
+            shared_state["gain_window_open"] = True
+            root.after(0, open_gain_window)
+        else:
+            print("Signal change window is already open.")
+
+    # === BOUTONS ===
+    button_frame = ttk.Frame(root, padding=10)
+    button_frame.pack(pady=20, side="top")
+    button_frame.grid_columnconfigure(0, weight=1)
+    button_frame.grid_columnconfigure(1, weight=1)
+
+    ttk.Button(button_frame, text="Choose a folder", command=launch_monitor).grid(row=0, column=0, padx=5, pady=5,sticky="ew")
+    ttk.Button(button_frame, text="Select file", command=process_selected_files).grid(row=0, column=1, padx=5,pady=5, sticky="ew")
+    ttk.Button(button_frame, text="Raw trace (unfiltered)", command=plot_raw_selected_files).grid(row=1, column=0,padx=5, pady=5,sticky="ew")
+
+    ttk.Button(button_frame, text="Display signal change", command=show_gain_window).grid(row=1, column=1, padx=5, pady=5,sticky="ew")
+    ttk.Button(button_frame, text="Export Excel", command=export_to_excel, style="Blue.TButton").grid(row=2, column=0, padx=5, pady=5,sticky="ew")
+    ttk.Button(button_frame, text="Stop", command=stop_processing).grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+    ttk.Button(button_frame, text="Reset", command=reset_button_action, style="Danger.TButton").grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+
+    # === SECTION BOUTONS SECM VIRTUEL/.DAT côte à côte (SOUS "Réinitialiser") ===
+    map_buttons_frame = ttk.Frame(button_frame)
+    map_buttons_frame.grid(row=4, column=0, columnspan=2, pady=(15, 5), sticky="ew")
+    map_buttons_frame.grid_columnconfigure(0, weight=1)
+    map_buttons_frame.grid_columnconfigure(1, weight=1)
+    map_buttons_frame.grid_rowconfigure(0, weight=1)
+
+
+
+    # Colonne SECM .dat (unique)
+    dat_frame = ttk.Frame(map_buttons_frame)
+    dat_frame.grid(row=0, column=0, padx=15, sticky="nsew")
+
+    ttk.Button(dat_frame, text="Load SECM positions", command=load_secm_positions, style="Green.TButton") \
+        .pack(fill="x", pady=(0, 5))
+    ttk.Button(dat_frame, text="Process SECM (.dat)", command=run_secm_mapping_dat, style="Green.TButton") \
+        .pack(fill="x", pady=(0, 5))
+
+    # Type de carte et échelle (on conserve ces contrôles pour .dat)
+    ttk.Label(dat_frame, text="Type of map :", font=("Arial", 10, "bold")).pack(anchor="w", pady=(10, 0))
+    shared_state["map_type_var"] = tk.StringVar(value="Raw peak height")
+    ttk.Combobox(
+        dat_frame,
+        textvariable=shared_state["map_type_var"],
+        values=["Raw peak height", "Signal change (%)", "Concentration (Langmuir-Hill)"],
+        state="readonly",
+        width=20
+    ).pack(fill="x", pady=(0, 5))
+
+    ttk.Label(dat_frame, text="Concentration scale  :", font=("Arial", 9, "bold")).pack(anchor="w", pady=(5, 0))
+    shared_state["conc_scale_var"] = tk.StringVar(value="Linear")
+    ttk.Combobox(
+        dat_frame,
+        textvariable=shared_state["conc_scale_var"],
+        values=["Linear", "Logarithmic"],
+        state="readonly",
+        width=20
+    ).pack(fill="x", pady=(0, 5))
+    # Option: échelle couleur fixe pour cartes de concentration
+    shared_state["fixed_conc_enable_var"] = tk.BooleanVar(value=False)
+    shared_state["fixed_conc_min_var"] = tk.DoubleVar(value=0.0)  # en M (ex: 0.0)
+    shared_state["fixed_conc_max_var"] = tk.DoubleVar(value=500e-9)  # en M (ex: 500 nM = 5e-7 M)
+
+    ttk.Checkbutton(
+        dat_frame,
+        text="Fixed color scale (Concentration)",
+        variable=shared_state["fixed_conc_enable_var"]
+    ).pack(fill="x", pady=(4, 2))
+
+    frame_fix = ttk.Frame(dat_frame)
+    frame_fix.pack(fill="x", pady=(0, 5))
+    ttk.Label(frame_fix, text="Min (M)").grid(row=0, column=0, sticky="w")
+    ttk.Entry(frame_fix, textvariable=shared_state["fixed_conc_min_var"], width=10).grid(row=0, column=1, padx=4)
+    ttk.Label(frame_fix, text="Max (M)").grid(row=0, column=2, sticky="w")
+    ttk.Entry(frame_fix, textvariable=shared_state["fixed_conc_max_var"], width=10).grid(row=0, column=3, padx=4)
+
+
+    def launch_secm_map_dat():
+        map_type = shared_state["map_type_var"].get()
+        gain_map = (map_type == "Signal change (%)")
+        conc_map = (map_type == "Concentration (Langmuir-Hill)")
+        conc_scale = shared_state.get("conc_scale_var", None)
+        log_scale = (conc_map and conc_scale and conc_scale.get() == "Logarithmique")
+        print(f"🗺️ Type of map : {map_type}")
+        generate_secm_map_dat(normalize=gain_map, concentration_map=conc_map, log_scale=log_scale)
+
+    ttk.Button(dat_frame, text="Display SECM map (.dat)",
+               command=launch_secm_map_dat,
+               style="Green.TButton").pack(fill="x", pady=(0, 5))
+
+    # Si tu as ajouté l’export vectoriel pour la carte .dat:
+    ttk.Button(dat_frame, text="Save SECM map (.dat) (SVG/PDF/EPS)",
+               command=save_current_dat_map_vector,
+               style="Green.TButton").pack(fill="x", pady=(0, 5))
+
+    set_format_coord_xy(ax)
+    root.mainloop()
+
+
+# --- Fonction pour tracer brut (non baseline, sans nettoyage outliers) ---
+def plot_raw_selected_files():
+    """
+    Sélectionne des fichiers et trace le voltammogramme "brut" au sens:
+    - sans nettoyage des outliers (pas de Hampel/MAD)
+    - avec filtre Savitzky–Golay (UI)
+    - avec auto-inversion (même logique que le traitement)
+    - sans baseline ni corrections
+    """
+    ax = shared_state.get("ax")
+    canvas = shared_state.get("canvas")
+    if ax is None or canvas is None:
+        print("⚠️ UI non initialisée.")
+        return
+
+    file_paths = filedialog.askopenfilenames(filetypes=[("Text files", "*.txt")])
+    if not file_paths:
+        print("❌ Aucun fichier sélectionné (brut).")
+        return
+
+    params = get_current_parameters()
+    if params is None:
+        print("⚠️ Paramètres invalides (brut).")
+        return
+
+    pot_min, pot_max     = params["plage_potentiel"]
+    peak_range           = params["position_pic"]
+    window_length        = params["window_length"]
+    polyorder            = params["polyorder"]
+
+
+    for file_path in file_paths:
+        try:
+            df = lire_donnees(file_path)
+            y_series = (df['Courant (uA)'] if 'Courant (uA)' in df.columns else df['Courant inverse (uA)']).astype(float)
+            y_raw = y_series.to_numpy(dtype=float)
+            pot   = df['Potentiel (V)'].to_numpy(dtype=float)
+
+            # Auto-inversion: même logique que le traitement
+            mask_pot  = (pot >= pot_min) & (pot <= pot_max)
+            mask_peak = (pot >= peak_range[0]) & (pot <= peak_range[1])
+            mask_both = mask_pot & mask_peak
+
+            try:
+                if mask_both.any():
+                    y_window = y_raw[mask_both]
+                elif mask_pot.any():
+                    y_window = y_raw[mask_pot]
+                else:
+                    y_window = y_raw
+
+                invert = False
+                if y_window.size > 0:
+                    v = y_window[np.argmax(np.abs(y_window))]
+                    invert = (v < 0)
+            except Exception as e:
+                print(f"⚠️ Auto-inversion ignorée (raison: {e})")
+                invert = False
+
+            # Mode superposition -> on masque le texte fixe du pic (sinon ça peut induire en erreur)
+            ax = shared_state.get("ax")
+            canvas = shared_state.get("canvas")
+            update_fixed_peak_display(ax, canvas, visible=False)
+
+
+
+            # Appliquer inversion et Savitzky définitif
+            y_used     = (-y_raw if invert else y_raw)
+            y_filtered = apply_savgol_filter(y_used, window_length=window_length, polyorder=polyorder)
+
+            # Masque de tracé sur la plage UI
+            mask = (pot >= pot_min) & (pot <= pot_max)
+            if mask.any():
+                pot_plot = pot[mask]
+                y_plot   = y_filtered[mask]
+            else:
+                pot_plot = pot
+                y_plot   = y_filtered
+
+            ax.plot(pot_plot, y_plot,
+                    label=f"Raw trace (SG, without anti-spikes): {os.path.basename(file_path)}",
+                    alpha=0.85, linewidth=1.4)
+            print(f"📈 Raw trace : {os.path.basename(file_path)}")
+        except Exception as e:
+            print(f"⚠️ Impossible de tracer brut pour {os.path.basename(file_path)} : {e}")
+
+    ax.set_xlabel("Potential (V)")
+    ax.set_ylabel("Current (µA)")
+    ax.set_title("Voltammograms without Hampel outliers cleaning")
+    ax.legend(loc="best", fontsize=8)
+    canvas.draw_idle()
+
+def update_gain_plot(ax_gain, canvas_gain, results):
+    """
+    Met à jour le graphique du gain en fonction du temps pour tous les fichiers traités.
+    """
+    if len(results) < 5:
+        return  # Attendre un minimum de 5 fichiers avant de tracer
+
+    # Recalculer les données pour le graphique
+    times = [res["Cumulated time (s)"] for res in results]
+    gains = [res["Signal change (%)"] for res in results]
+
+    # Nettoyer l'axe précédent
+    ax_gain.clear()
+    ax_gain.plot(times, gains, marker='o', linestyle='-', color='blue', label="Signal change (%)")
+    ax_gain.set_title("Signal Change (%) vs Time")
+    ax_gain.set_xlabel("Cumulated time (s)")
+    ax_gain.set_ylabel("Signal change (%)")
+    ax_gain.legend()
+
+    # --- CADRAGE ROBUSTE ---
+    ax_gain.relim()
+    ax_gain.autoscale_view(scalex=True, scaley=True)
+
+    # Ajouter une petite marge (évite "collé au bord" / hors cadre)
+    ax_gain.margins(x=0.03, y=0.12)
+
+    # Redessiner le graphique
+    canvas_gain.draw_idle()
+
+
+def generate_secm_map_dat(normalize=False, concentration_map=False, log_scale=False):
+    """
+    Génère une carte SECM en utilisant les positions chargées depuis le fichier .dat.
+
+    - normalize=True   -> carte de Signal change (%) (sinon Hauteur brute)
+    - concentration_map=True -> carte de concentration (Langmuir-Hill)
+        * si log_scale=True  -> LogNorm sur la color map (ticks 10^… M), valeur au curseur en M
+        * si log_scale=False -> échelle linéaire avec unité auto (nM/µM/mM/M), valeur au curseur dans la même unité
+
+    Ajustement demandé:
+    - Gains négatifs => concentration plancher de 1 nM (1e-9 M) pour le tracé.
+    - En log: on borne aussi l’affichage à ≥ 1e-9 M pour éviter une échelle trop basse.
+    """
+    if not results:
+        print("📭 Aucun résultat disponible pour générer la carte SECM .dat.")
+        return
+    if not secm_positions:
+        print("⚠️ Aucune position SECM .dat chargée. Utilisez 'Charger positions SECM' d'abord.")
+        return
+
+    import matplotlib.pyplot as plt
+    from scipy.interpolate import griddata
+    from scipy.ndimage import gaussian_filter
+    from matplotlib import colors as mcolors, ticker as mticker
+
+    MIN_CONC_FLOOR = 1e-9  # 1 nM
+
+    # Association fichier → position
+    pos_map = shared_state.get("pos_by_file", {})
+
+    # Filtrer uniquement les résultats avec positions valides
+    valid_results = []
+    for res in results:
+        file_base = os.path.basename(res["Nom du fichier"]).lower()
+        if file_base in pos_map or (res.get("X rel. (µm)") is not None and res.get("Y rel. (µm)") is not None):
+            valid_results.append(res)
+    if not valid_results:
+        print("⚠️ Aucune correspondance trouvée entre résultats et positions .dat.")
+        return
+
+    xs = np.array([res["X rel. (µm)"] for res in valid_results], dtype=float)
+    ys = np.array([res["Y rel. (µm)"] for res in valid_results], dtype=float)
+
+    # Base: hauteur de pic
+    heights = np.array([res["Peak height (µA)"] for res in valid_results], dtype=float)
+
+    # === Mode Hauteur brute / Gain ===
+    if not concentration_map:
+        ref_h = shared_state.get("norm_ref_height")
+        if normalize and len(heights) > 0:
+            if ref_h and ref_h > 0:
+                heights = ((heights / ref_h) - 1) * 100.0
+                label_cbar = "Signal change (%)"
+                print(f"🔹 Carte de gain basée sur référence externe: {ref_h:.3f} µA")
+            else:
+                ref_index = shared_state.get("last_parameters", {}).get("normalisation_index", 3)
+                if 0 <= ref_index < len(valid_results):
+                    ref_value = valid_results[ref_index]["Peak height (µA)"]
+                    ref_x = valid_results[ref_index]["X rel. (µm)"]
+                    ref_y = valid_results[ref_index]["Y rel. (µm)"]
+                    print(f"🔹 Carte de gain basée sur le point {ref_index} ({ref_x:.0f} µm, {ref_y:.0f} µm) | Ref = {ref_value:.3f}")
+                else:
+                    ref_value = np.nanmax(heights)
+                    print(f"⚠️ Index de normalisation invalide ({ref_index}), utilisation du maximum ({ref_value:.3f}) comme référence.")
+                if ref_value and ref_value > 0:
+                    heights = ((heights / ref_value) - 1) * 100.0
+                label_cbar = "Signal change (%)"
+        else:
+            label_cbar = "Peak height (µA)"
+
+
+
+    # === Mode Concentration (Langmuir‑Hill) ===
+    label_cbar = "Concentration (M)" if concentration_map else label_cbar
+    concentration = None  # en M
+    if concentration_map:
+        try:
+            Vmax = float(shared_state["Vmax_var"].get())
+            K    = float(shared_state["K_var"].get())
+            n    = float(shared_state["n_var"].get())
+        except Exception as e:
+            print(f"⚠️ Erreur lecture Vmax/K/n : {e}")
+            return
+
+        # Gain (%) source
+        ref_h = shared_state.get("norm_ref_height")
+        if ref_h and ref_h > 0:
+            # Gain basé sur la référence externe (prioritaire)
+            gain_array = ((heights / float(ref_h)) - 1.0) * 100.0
+            print(f"🔹 Carte de concentration basée sur référence externe: {float(ref_h):.3f} µA")
+        else:
+            # Fallback: index de normalisation courant (UI), borné
+            ref_index = shared_state.get("last_parameters", {}).get("normalisation_index", 3)
+            if 0 <= ref_index < len(valid_results):
+                ref_value = valid_results[ref_index]["Peak height (µA)"]
+                print(f"🔹 Carte de concentration basée sur le point {ref_index} (réf = {ref_value:.3f} µA)")
+            else:
+                ref_value = float(np.nanmax(heights))
+                print(
+                    f"⚠️ Index de normalisation invalide ({ref_index}), utilisation du maximum ({ref_value:.3f} µA) comme référence.")
+            if ref_value and ref_value > 0:
+                gain_array = ((heights / ref_value) - 1.0) * 100.0
+            else:
+                gain_array = np.full_like(heights, np.nan, dtype=float)
+
+        # Politique:
+        # - g < 0    -> C = 1 nM
+        # - g = 0    -> C = 0 M (physique)
+        # - 0 < g < g_upper -> conversion inverse
+        # - g >= g_upper    -> saturer pour rester fini
+        safety_margin = 0.01 * Vmax
+        g_upper = Vmax - safety_margin
+
+        concentration = np.full_like(gain_array, np.nan, dtype=float)
+
+        mask_neg  = np.isfinite(gain_array) & (gain_array < 0)
+        mask_zero = np.isfinite(gain_array) & (gain_array == 0)
+        mask_mid  = np.isfinite(gain_array) & (gain_array > 0) & (gain_array < g_upper)
+        mask_hi   = np.isfinite(gain_array) & (gain_array >= g_upper)
+
+        concentration[mask_neg]  = MIN_CONC_FLOOR
+        concentration[mask_zero] = 0.0
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            if np.any(mask_mid):
+                ratio_mid = gain_array[mask_mid] / (Vmax - gain_array[mask_mid])
+                concentration[mask_mid] = K * (ratio_mid ** (1.0 / n))
+            if np.any(mask_hi):
+                ratio_hi = g_upper / (Vmax - g_upper)
+                concentration[mask_hi] = K * (ratio_hi ** (1.0 / n))
+
+        # Nettoyage sécurité
+        concentration[(~np.isfinite(concentration)) | (concentration < 0)] = 0.0
+        # Sauvegarde
+        for i, res in enumerate(valid_results):
+            res["Concentration_calc (M)"] = concentration[i]
+
+        heights = concentration.copy()  # base pour interpolation
+
+    # Limites XY
+    x_min, x_max = np.nanmin(xs), np.nanmax(xs)
+    y_min, y_max = np.nanmin(ys), np.nanmax(ys)
+
+    # Grille d'interpolation
+    grid_size = 300
+    xi = np.linspace(x_min, x_max, grid_size)
+    yi = np.linspace(y_min, y_max, grid_size)
+    xi_grid, yi_grid = np.meshgrid(xi, yi)
+    # Limites arrondies à la centaine (définir AVANT les edges)
+    x0 = float(np.floor(x_min / 100.0) * 100.0)
+    x1 = float(np.ceil(x_max / 100.0) * 100.0)
+    y0 = float(np.floor(y_min / 100.0) * 100.0)
+    y1 = float(np.ceil(y_max / 100.0) * 100.0)
+
+    # Construire des vecteurs d'arêtes (edges) couvrant exactement [x0, x1] et [y0, y1]
+    dx = float(xi[1] - xi[0]) if xi.size > 1 else 1.0
+    dy = float(yi[1] - yi[0]) if yi.size > 1 else 1.0
+
+    x_edges = np.empty(xi.size + 1, dtype=float)
+    y_edges = np.empty(yi.size + 1, dtype=float)
+
+    x_edges[1:-1] = 0.5 * (xi[:-1] + xi[1:])
+    x_edges[0] = xi[0] - dx / 2.0
+    x_edges[-1] = xi[-1] + dx / 2.0
+
+    y_edges[1:-1] = 0.5 * (yi[:-1] + yi[1:])
+    y_edges[0] = yi[0] - dy / 2.0
+    y_edges[-1] = yi[-1] + dy / 2.0
+
+    # Forcer les bords sur tes limites arrondies
+    x_edges[0], x_edges[-1] = x0, x1
+    y_edges[0], y_edges[-1] = y0, y1
+
+    # Interpolation (cascade)
+    zi = None
+    for method in ('cubic', 'linear', 'nearest'):
+        try:
+            zi_try = griddata((xs, ys), heights, (xi_grid, yi_grid), method=method)
+            if zi is None and zi_try is not None:
+                zi = zi_try
+            if zi_try is not None and not np.all(np.isnan(zi_try)):
+                zi = zi_try
+                break
+        except Exception as e:
+            print(f"⚠️ Erreur interpolation ({method}): {e}")
+
+    if zi is None:
+        print("⚠️ Échec de l'interpolation.")
+        return
+
+    # Inpainting nearest des trous (hors hull, etc.)
+    try:
+        h, w = zi.shape
+        J, I = np.mgrid[0:h, 0:w]
+        valid = np.isfinite(zi)
+        if not np.all(valid):
+            points_valid = np.column_stack((I[valid], J[valid]))
+            values_valid = zi[valid]
+            points_all   = np.column_stack((I.ravel(), J.ravel()))
+            zi_nearest   = griddata(points_valid, values_valid, points_all, method='nearest').reshape(h, w)
+            inpaint_mask = ~valid
+            zi = np.where(valid, zi, zi_nearest)
+        else:
+            inpaint_mask = np.zeros_like(zi, dtype=bool)
+    except Exception as e:
+        print(f"ℹ️ Inpainting nearest indisponible: {e}")
+        inpaint_mask = np.zeros_like(zi, dtype=bool)
+
+    # Clippage basique et lissage
+    zi = np.where(np.isfinite(zi), zi, 0.0)
+    zi[zi < 0] = 0.0
+    zi_smooth = gaussian_filter(zi, sigma=3)
+
+
+    # === Tracé (UNE seule colorbar) ===
+    fig, ax = plt.subplots(figsize=SECM_FIGSIZE)
+    shared_state["last_dat_map_fig"] = fig
+    # Mémoriser la figure pour export vectoriel via l’UI
+    shared_state["last_dat_map_fig"] = fig
+    cmap = plt.get_cmap('seismic')
+
+
+    # Utilitaire curseur
+    def _nearest_val(x, y, xi_arr, yi_arr, z_grid):
+        try:
+            if not (np.isfinite(x) and np.isfinite(y)):
+                return np.nan, (None, None)
+            i = int(np.nanargmin(np.abs(xi_arr - x)))
+            j = int(np.nanargmin(np.abs(yi_arr - y)))
+            val = z_grid[j, i]
+            return float(val) if np.isfinite(val) else np.nan, (j, i)
+        except Exception:
+            return np.nan, (None, None)
+
+    show_hover = shared_state.get("show_hover_value_var").get() if shared_state.get("show_hover_value_var") else True
+
+    if concentration_map:
+        # Cmax à partir des points (non lissés)
+        finite_conc = concentration[np.isfinite(concentration)] if concentration is not None else np.array([])
+        Cmax_M = float(np.nanmax(finite_conc)) if finite_conc.size else 0.0
+
+        # Lecture option échelle fixe (en M) depuis l’UI
+        fixed = bool(shared_state.get("fixed_conc_enable_var") and shared_state["fixed_conc_enable_var"].get())
+        vmin_user = float(shared_state["fixed_conc_min_var"].get()) if fixed else None
+        vmax_user = float(shared_state["fixed_conc_max_var"].get()) if fixed else None
+
+        # Validation simple
+        if fixed and (not np.isfinite(vmin_user) or not np.isfinite(vmax_user) or vmin_user >= vmax_user):
+            print("⚠️ Échelle de concentration fixe invalide (min/max). Option ignorée.")
+            fixed = False
+        if log_scale:
+            # LogNorm: on borne l’affichage à ≥ 1 nM pour éviter des échelles 10^-18
+            zi_plot = zi_smooth.copy()
+            zi_plot = np.where(zi_plot > 0, zi_plot, MIN_CONC_FLOOR)
+
+            # Déterminer vmin/vmax propres
+            pos_vals = zi_plot[zi_plot > 0]
+            zmin_pos = float(np.nanmin(pos_vals)) if pos_vals.size else MIN_CONC_FLOOR
+            zmax_pos = float(np.nanmax(pos_vals)) if pos_vals.size else MIN_CONC_FLOOR
+            zmin_pos = max(zmin_pos, MIN_CONC_FLOOR)
+
+            vmin = max(MIN_CONC_FLOOR, 10.0 ** np.floor(np.log10(zmin_pos)))
+            vmax = 10.0 ** np.ceil(np.log10(zmax_pos))
+            if vmin >= vmax:
+                vmax = vmin * 10.0
+
+            norm = mcolors.LogNorm(vmin=vmin, vmax=vmax, clip=True)
+            mesh = ax.pcolormesh(xi, yi, zi_plot, cmap=cmap, norm=norm, shading='auto')
+            cbar = plt.colorbar(mesh, ax=ax, pad=0.08, shrink=1.0)
+            cbar.set_label("Concentration (M)", fontsize=24, fontweight="bold")
+            cbar.locator   = mticker.LogLocator(base=10, numticks=5)
+            cbar.formatter = mticker.LogFormatterMathtext(base=10)
+            cbar.update_ticks()
+
+
+            if show_hover:
+                def _fmt(x, y):
+                    val, (j, i) = _nearest_val(x, y, xi, yi, zi_smooth)
+                    if not np.isfinite(val) or val <= 0:
+                        tag = " (estimé)" if (j is not None and inpaint_mask[j, i]) else ""
+                        # Affiche 0 là où la vraie concentration est 0 (g=0)
+                        return f"x={x:.2f} µm, y={y:.2f} µm, C=0 M{tag}"
+                    tag = " (estimé)" if (j is not None and inpaint_mask[j, i]) else ""
+                    return f"x={x:.2f} µm, y={y:.2f} µm, C={val:.3e} M{tag}"
+                ax.format_coord = _fmt
+
+
+        else:
+            # Linéaire avec unité auto
+            finite_vals = zi_smooth[np.isfinite(zi_smooth)]
+            if finite_vals.size == 0:
+                print("⚠️ Pas de valeurs finies pour l'échelle linéaire.")
+                return
+            max_conc = float(np.nanmax(finite_vals))
+            if max_conc < 1e-6 and max_conc > 0:
+                scale = 1e9; unit_txt = "nM"
+            elif max_conc < 1e-3 and max_conc > 0:
+                scale = 1e6; unit_txt = "µM"
+            elif max_conc < 1 and max_conc > 0:
+                scale = 1e3; unit_txt = "mM"
+            else:
+                scale = 1.0; unit_txt = "M"
+
+            zi_lin = zi_smooth * scale
+
+            if fixed:
+                # Impose vmin/vmax dans l’unité affichée (nM/µM/mM/M)
+                vmin_lin = vmin_user * scale
+                vmax_lin = vmax_user * scale
+                norm = mcolors.Normalize(vmin=vmin_lin, vmax=vmax_lin, clip=True)
+                mesh = ax.pcolormesh(x_edges, y_edges, zi_lin, cmap=cmap, norm=norm, shading='flat')
+            else:
+                mesh = ax.pcolormesh(x_edges, y_edges, zi_lin, cmap=cmap, shading='flat')
+
+            cbar = plt.colorbar(mesh, ax=ax, pad=0.08, shrink=1.0)
+            cbar.set_label(f"Concentration ({unit_txt})", fontsize=24, fontweight="bold")
+
+            # Ticks (3): si échelle fixe → basés sur vmin/vmax fixés ; sinon → basés sur les données
+            if fixed:
+                t0 = 0.0 if np.isclose(vmin_lin, 0.0) else vmin_lin
+                t2 = 100.0 * np.floor(vmax_lin / 100.0)
+                t2 = min(t2, vmax_lin)
+                # Milieu exact (pour 0–500 => 250), sans arrondi pour garder l’équidistance visuelle
+                t1 = 0.5 * (t0 + t2)
+                ticks = [t0, t1, t2]
+                cbar.set_ticks(ticks)
+                cbar.set_ticklabels([f"{int(round(t)):d}" if t >= 100 else f"{t:.0f}" for t in ticks])
+            else:
+                vmin_lin = float(np.nanmin(zi_lin))
+                vmax_lin = float(np.nanmax(zi_lin))
+                if not np.isfinite(vmin_lin) or not np.isfinite(vmax_lin) or vmin_lin == vmax_lin:
+                    vmin_lin, vmax_lin = 0.0, 1.0
+                t0 = 0.0
+                t2 = 100.0 * np.floor(vmax_lin / 100.0)
+                if t2 <= t0:
+                    t2 = vmax_lin
+                t1 = (t0 + t2) / 2.0
+                if t2 >= 200.0:
+                    t1 = 100.0 * np.round(t1 / 100.0)
+                t2 = min(t2, vmax_lin)
+                t1 = min(max(t1, t0), t2)
+                ticks = [t0, t1, t2]
+                cbar.set_ticks(ticks)
+                cbar.set_ticklabels([f"{int(round(t)):d}" if t >= 100 else f"{t:.0f}" for t in ticks])
+
+
+            for lbl in cbar.ax.get_yticklabels():
+                lbl.set_fontsize(20)
+                lbl.set_fontweight("bold")
+
+            # Afficher C_max au-dessus de la colorbar (hors carte), dans l’unité courante
+            if np.isfinite(Cmax_M) and Cmax_M >= 0:
+                if scale != 1.0:
+                    cbar.ax.set_title(f"C_max = {Cmax_M * scale:.3g} {unit_txt}",
+                                      fontsize=12, fontweight="bold", pad=20)
+                else:
+                    cbar.ax.set_title(f"C_max = {Cmax_M:.3e} M", fontsize=16, fontweight="bold", pad=20)
+
+            # Affichage de la valeur au survol de la colorbar (linéaire, unité zi_lin => unit_txt: nM/µM/mM/M)
+            if show_hover:
+                def _fmt_cbar_lin(x, y, _unit=unit_txt):
+                    if not np.isfinite(y):
+                        return f"C=nan {_unit}"
+                    return f"C={y:.3g} {_unit}"
+
+                cbar.ax.format_coord = _fmt_cbar_lin
+
+            if show_hover:
+                def _fmt(x, y, _zi_lin=zi_lin, _xi=xi, _yi=yi, _unit=unit_txt):
+                    val, (j, i) = _nearest_val(x, y, _xi, _yi, _zi_lin)
+                    if not np.isfinite(val):
+                        return f"x={x:.2f} µm, y={y:.2f} µm, C=nan"
+                    tag = " (estimé)" if (j is not None and inpaint_mask[j, i]) else ""
+                    # Si la concentration réelle est 0 (g=0), afficher 0
+                    val_raw, _ = _nearest_val(x, y, _xi, _yi, zi_smooth)
+                    if np.isfinite(val_raw) and val_raw == 0:
+                        return f"x={x:.2f} µm, y={y:.2f} µm, C=0 {_unit}{tag}"
+                    return f"x={x:.2f} µm, y={y:.2f} µm, C={val:.3g} {_unit}{tag}"
+                ax.format_coord = _fmt
+
+
+    else:
+        # Hauteur brute / Gain
+        mesh = ax.pcolormesh(x_edges, y_edges, zi_smooth, cmap=cmap, shading='flat')
+        cbar = plt.colorbar(mesh, ax=ax, pad=0.08, shrink=1.0)
+        cbar.set_label(label_cbar, fontsize=24, fontweight="bold")
+        if "Gain" in label_cbar:
+            # Choisis 4 ticks (change numticks à 3 si tu préfères 3 ticks)
+            cbar.locator = mticker.LinearLocator(numticks=3)
+            # Libellés arrondis à la dizaine, sans modifier l'échelle
+            cbar.formatter = tens_formatter  # défini en global: FuncFormatter(lambda v, pos: f"{int(np.round(v/10)*10)}")
+            cbar.update_ticks()
+            # Ticks de la colorbar (Gain %) en gras et plus grands
+            cbar.ax.tick_params(axis='y', labelsize=20)
+            for lbl in cbar.ax.get_yticklabels():
+                lbl.set_fontweight('bold')
+            # Affichage de la valeur au survol de la colorbar (Gain %)
+            if show_hover:
+                def _fmt_cbar_gain(x, y):
+                    # y est la valeur sur l’axe de la colorbar (en %)
+                    if not np.isfinite(y):
+                        return "Gain=nan %"
+                    return f"Gain={y:.2f} %"
+                cbar.ax.format_coord = _fmt_cbar_gain
+        else:
+            cbar.locator = mticker.LinearLocator(numticks=5)
+            cbar.update_ticks()
+            # Ticks de la colorbar (Hauteur du pic) en gras et plus grands
+            cbar.ax.tick_params(axis='y', labelsize=20)
+            for lbl in cbar.ax.get_yticklabels():
+                lbl.set_fontweight('bold')
+
+        if show_hover:
+            if "Gain" in label_cbar:
+                def _fmt(x, y):
+                    val, _ = _nearest_val(x, y, xi, yi, zi_smooth)
+                    if not np.isfinite(val):
+                        return f"x={x:.2f} µm, y={y:.2f} µm, Gain=nan"
+                    return f"x={x:.2f} µm, y={y:.2f} µm, Gain={val:.2f} %"
+                ax.format_coord = _fmt
+            else:
+                def _fmt(x, y):
+                    val, _ = _nearest_val(x, y, xi, yi, zi_smooth)
+                    if not np.isfinite(val):
+                        return f"x={x:.2f} µm, y={y:.2f} µm, I=nan"
+                    return f"x={x:.2f} µm, y={y:.2f} µm, I={val:.3f} µA"
+                ax.format_coord = _fmt
+
+    ax.set_xlabel("X (µm)", fontsize=24, fontweight="bold")
+    ax.set_ylabel("Y (µm)", fontsize=24, fontweight="bold")
+
+    # Limites arrondies à la centaine (vers l'extérieur pour bien couvrir les données)
+    x0 = np.floor(x_min / 100.0) * 100.0
+    x1 = np.ceil(x_max / 100.0) * 100.0
+    y0 = np.floor(y_min / 100.0) * 100.0
+    y1 = np.ceil(y_max / 100.0) * 100.0
+
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_aspect('equal', adjustable='box')
+
+    ax.xaxis.set_major_locator(LinearLocator(numticks=3))
+    ax.yaxis.set_major_locator(LinearLocator(numticks=3))
+    ax.xaxis.set_major_formatter(FormatStrFormatter('%.0f'))
+    ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
+    # Style des ticks des axes X/Y
+    ax.tick_params(axis="both", labelsize=20)
+    for lbl in ax.get_xticklabels():
+        lbl.set_fontweight("bold")
+    for lbl in ax.get_yticklabels():
+        lbl.set_fontweight("bold")
+    plt.tight_layout()
+    plt.show()
+
+def save_current_dat_map_vector():
+    """
+    Enregistre la dernière carte SECM (.dat) affichée en format vectoriel (SVG/PDF/EPS).
+    Nécessite que generate_secm_map_dat ait été appelé au moins une fois.
+    """
+    fig = shared_state.get("last_dat_map_fig")
+    if fig is None:
+        print("⚠️ Aucune carte SECM (.dat) mémorisée. Affiche d’abord la carte.")
+        return
+    file_path = filedialog.asksaveasfilename(
+        title="Enregistrer la cartographie SECM (.dat) en vectoriel",
+        initialfile="carte_secm_dat.svg",
+        defaultextension=".svg",
+        filetypes=[
+            ("Fichiers SVG (vectoriel)", "*.svg"),
+            ("Fichiers PDF (vectoriel)", "*.pdf"),
+            ("Fichiers EPS (vectoriel)", "*.eps"),
+            ("Fichiers PNG (raster)", "*.png"),
+            ("Tous les fichiers", "*.*")
+        ]
+    )
+    if file_path:
+        try:
+            fig.savefig(file_path, dpi=300)
+            print(f"💾 SECM map (.dat) saved in : {file_path}")
+        except Exception as e:
+            print(f"💥 Erreur d’enregistrement vectoriel : {e}")
+
+
+def open_gain_window():
+    global gain_window, ax_gain, canvas_gain
+
+    if gain_window is not None:
+        try:
+            if hasattr(gain_window, 'after_id') and gain_window.after_id is not None:
+                gain_window.after_cancel(gain_window.after_id)
+            gain_window.destroy()
+        except Exception:
+            pass
+        gain_window = None
+
+    gain_window = tk.Toplevel()  # Utiliser Toplevel pour une vraie pop-up
+    gain_window.title("Évolution du Gain")
+    gain_window.geometry(GAIN_WINDOW_SIZE)
+
+    # Frame pour graphique et boutons
+    frame_main = ttk.Frame(gain_window, padding=10)
+    frame_main.pack(fill="both", expand=True)
+
+    # Graphique
+    fig_gain = Figure(figsize=GAIN_FIGSIZE)
+    ax_gain = fig_gain.add_subplot(111)
+    canvas_gain = FigureCanvasTkAgg(fig_gain, master=frame_main)
+    canvas_widget_gain = canvas_gain.get_tk_widget()
+    canvas_widget_gain.pack(fill="both", expand=True)
+
+    # --- Toolbar Matplotlib (comme carte SECM) ---
+    toolbar = NavigationToolbar2Tk(canvas_gain, frame_main)
+    toolbar.update()
+    toolbar.pack(side="bottom", fill="x")
+
+    gain_window.after_id = None
+
+    def refresh_plot():
+        if len(results) >= 5:
+            update_gain_plot(ax_gain, canvas_gain, results)
+        if gain_window.winfo_exists():
+            gain_window.after_id = gain_window.after(2000, refresh_plot)
+
+    def on_close():
+        if gain_window.after_id is not None:
+            try:
+                gain_window.after_cancel(gain_window.after_id)
+            except Exception:
+                pass
+        gain_window.destroy()
+        shared_state["gain_window_open"] = False
+
+    gain_window.protocol("WM_DELETE_WINDOW", on_close)
+    refresh_plot()
+
+def reset_application(ax, canvas):
+    global results, shared_state, gain_window, root
+    """
+    Réinitialise l'application en vidant les résultats, réinitialisant les graphiques,
+    et permettant à l'utilisateur de redémarrer.
+    """
+    if len(results) > 20:
+        from tkinter import messagebox
+        if root and root.winfo_exists():
+            response = messagebox.askyesno(
+                "⚠️ Confirmer la réinitialisation",
+                f"Vous avez {len(results)} résultats en mémoire.\n\n"
+                "Êtes-vous sûr de vouloir réinitialiser ?\n"
+                "(Les résultats non exportés seront perdus)"
+            )
+            if not response:  # Utilisateur a cliqué "Non"
+                print("❌ Réinitialisation annulée par l'utilisateur.")
+                return  # ← Sort de la fonction, ne réinitialise pas
+
+    # Réinitialiser les résultats
+    results.clear()
+    shared_state["stop"] = True  # Arrêter toute surveillance en cours
+    shared_state["gain_window_open"] = False  # Réinitialiser l'état de la fenêtre du gain
+    shared_state["directory"] = None
+
+    # Fermer la fenêtre du gain de manière sécurisée
+    if gain_window:
+        try:
+            # Annule le after si programmé
+            if hasattr(gain_window, 'after_id') and gain_window.after_id is not None:
+                try:
+                    gain_window.after_cancel(gain_window.after_id)
+                except Exception:
+                    pass
+            # Détruit la fenêtre si elle existe encore (ignore l’erreur si déjà détruite)
+            try:
+                if root is not None and hasattr(gain_window, "destroy"):
+                    root.after(0, gain_window.destroy)
+            except Exception as e:
+                if "application has been destroyed" not in str(e):
+                    print(f"⚠️ Erreur lors de la destruction de la fenêtre du gain : {e}")
+        except Exception as e:
+            print(f"⚠️ Erreur lors de la fermeture de la fenêtre du gain (try principal): {e}")
+        gain_window = None
+
+        # ✅ Clear d'abord
+    ax.clear()
+    ax.set_title("Voltammogram")
+    ax.set_xlabel("Potential (V)")
+    ax.set_ylabel("Currant (µA)")
+
+    # ✅ Puis recréer l'affichage bas-droite + coordonnées souris
+    shared_state["peak_text_artist"] = None
+    set_format_coord_xy(ax)
+    _ensure_peak_text_artist(ax)
+    update_fixed_peak_display(ax, canvas, visible=False)
+
+    canvas.draw_idle()
+    print("🔄 Reset over. You can restart.")
+
+
+def cleanup_before_exit():
+    print("Nettoyage avant la fermeture du programme.")
+    try:
+        if root and root.winfo_exists():  # Si la fenêtre existe
+            root.destroy()  # Ferme la fenêtre Tkinter
+    except Exception as e:
+        print(f"⚠️ Error during cleaning : {e}")
+
+atexit.register(cleanup_before_exit)
+
+#Ouvre la fenêtre pour choisir les fichiers et lancer le traitement
+start_realtime_display()
